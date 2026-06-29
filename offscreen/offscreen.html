@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SilentScribe Offscreen</title>
+  <!--
+    This is a minimal HTML shell required by Chrome's offscreen API.
+    It is NEVER shown to the user — it exists solely to provide a DOM
+    context where AudioContext, MediaRecorder, and getUserMedia can operate.
+
+    The service worker cannot use these APIs directly because MV3 service
+    workers have no DOM access. This offscreen document is the "hidden
+    recording room" of the extension.
+
+    Chrome enforces exactly ONE offscreen document per extension.
+  -->
+</head>
+<body>
+  <script src="offscreen.js" type="module"></script>
+</body>
+</html>
