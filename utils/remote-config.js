@@ -34,7 +34,7 @@ const LOG_PREFIX = '[SilentScribe Config]';
  * `.claude/.env` under SILENTSCRIBE_CONFIG_URL overrides this constant.
  */
 export const DEFAULT_CONFIG_URL =
-  'https://raw.githubusercontent.com/CHANGE-ME/silentscribe-config/main/config.json';
+  'https://raw.githubusercontent.com/hemalbadola/silentscribe/main/config.json';
 
 /** chrome.storage.local key for the cached remote config. */
 const CACHE_KEY = 'managedConfigCache';
