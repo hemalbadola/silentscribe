@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SilentScribe",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Records and transcribes meeting audio on your own device. Bring your own LLM key for notes.",
   "minimum_chrome_version": "116",
   "permissions": [

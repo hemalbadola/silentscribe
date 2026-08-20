@@ -155,6 +155,22 @@ chrome.runtime.onStartup.addListener(async () => {
  * Returns true for async handlers (required by Chrome to keep the
  * message channel open for sendResponse).
  */
+/**
+ * Catch a fire-and-forget handler's rejection.
+ *
+ * These handlers answer no message, so nothing awaited them and a rejection
+ * surfaced as "Uncaught (in promise)" in the service worker with no indication
+ * of which handler produced it — and, worse, silently abandoned whatever the
+ * handler had left to do.
+ *
+ * @param {string} name - The handler, for the log line.
+ * @returns {(err: Error) => void}
+ */
+const reportHandlerFailure = (name) => (err) => {
+  console.error(`[SilentScribe SW] ${name} failed:`, err);
+};
+
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Guard against malformed messages
   if (!message || !message.type) return false;
@@ -199,24 +215,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // ── From Content Script ──────────────────────────────────────
     case MSG.UI_ONBOARDING_COMPLETE:
-      handleOnboardingComplete(payload);
+      handleOnboardingComplete(payload).catch(reportHandlerFailure('handleOnboardingComplete'));
       return false;
 
     case MSG.MEETING_DETECTED:
-      handleMeetingDetected(payload);
+      handleMeetingDetected(payload).catch(reportHandlerFailure('handleMeetingDetected'));
       return false; // Sync — no response needed
 
     case MSG.MEETING_STATE_CHANGED:
-      handleMeetingStateChanged(payload);
+      handleMeetingStateChanged(payload).catch(reportHandlerFailure('handleMeetingStateChanged'));
       return false;
 
     // ── From Offscreen Document ──────────────────────────────────
     case MSG.CAPTURE_COMPLETE:
-      handleCaptureComplete(payload);
+      handleCaptureComplete(payload).catch(reportHandlerFailure('handleCaptureComplete'));
       return false;
 
     case MSG.CAPTURE_ERROR:
-      handleCaptureError(payload);
+      handleCaptureError(payload).catch(reportHandlerFailure('handleCaptureError'));
       return false;
 
     case MSG.CAPTURE_LEVELS:
@@ -241,11 +257,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
 
     case MSG.TRANSCRIPTION_COMPLETE:
-      handleTranscriptionComplete(payload);
+      handleTranscriptionComplete(payload).catch(reportHandlerFailure('handleTranscriptionComplete'));
       return false;
 
     case MSG.TRANSCRIPTION_ERROR:
-      handleTranscriptionError(payload);
+      handleTranscriptionError(payload).catch(reportHandlerFailure('handleTranscriptionError'));
       return false;
 
     default:
@@ -282,6 +298,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
  * @param {boolean} payload.micEnabled - Whether to capture microphone audio.
  * @returns {Promise<{success: boolean}>}
  */
+/**
+ * Explain why a tab can never be captured, or return null when it can.
+ *
+ * These are refusals no permission can lift: Chrome does not allow an
+ * extension to capture its own UI, another extension's pages, the Web Store,
+ * or the devtools window.
+ *
+ * @param {string|undefined} url - The tab's URL. Undefined when unreadable.
+ * @returns {string|null} A sentence for the user, or null if the tab is fine.
+ */
+function describeUncapturableTab(url) {
+  if (!url) return null;  // Unreadable is not the same as forbidden.
+
+  const named = [
+    [/^chrome:\/\//i, "Chrome's own pages, like chrome://extensions"],
+    [/^(edge|brave|opera|vivaldi|arc|comet):\/\//i, "your browser's own settings pages"],
+    [/^chrome-extension:\/\//i, 'extension pages, including this one'],
+    [/^devtools:\/\//i, 'the developer tools'],
+    [/^about:/i, 'browser pages like about:blank'],
+    [/^view-source:/i, 'a view-source page'],
+    [/^https?:\/\/(chrome\.google\.com\/webstore|chromewebstore\.google\.com)/i, 'the Chrome Web Store'],
+  ];
+
+  for (const [pattern, what] of named) {
+    if (pattern.test(url)) {
+      return `This tab cannot be recorded: Chrome never allows ${what} to be captured. `
+        + 'Switch to the tab with your meeting in it, then start the recording.';
+    }
+  }
+  return null;
+}
+
+
 async function handleStartRecording(payload) {
   console.log('[SilentScribe SW] Starting recording...', payload);
 
@@ -320,6 +369,13 @@ async function handleStartRecording(payload) {
     if (!activeTab || !activeTab.id) {
       throw new Error('No active tab found. Please focus the meeting tab and try again.');
     }
+
+    // Say so before trying. Chrome refuses to capture its own pages, and the
+    // refusal it gives back names the activeTab permission — which sends people
+    // off granting permissions that were never the problem. This tab can never
+    // be recorded, no matter what is granted.
+    const blocked = describeUncapturableTab(activeTab.url);
+    if (blocked) throw new Error(blocked);
 
     // Step 3: Get a media stream ID from tabCapture.
     // This returns a string token that the offscreen document uses to obtain

@@ -192,6 +192,22 @@ export async function setState(newState, metadata = {}) {
     const current = await getState();
     const currentStateName = current.state;
 
+    // Re-entering the state you are already in is redundant, not invalid.
+    //
+    // Every caller checks the state before asking for a transition, but the
+    // queue validates when the call RUNS. So two callers that both decide to
+    // recover to READY — the panel's Try Again and a second press of Record,
+    // after a failed start left the extension in ERROR — both read ERROR, both
+    // queue, and the second one used to throw "Invalid state transition:
+    // READY → READY" out of a fire-and-forget message handler, where nothing
+    // was there to catch it.
+    if (newState === currentStateName) {
+      const merged = { ...current, ...metadata, state: newState };
+      await chrome.storage.session.set({ [STATE_STORAGE_KEY]: merged });
+      broadcastState(merged);
+      return;
+    }
+
     // ERROR is reachable from any state — special case
     if (newState !== STATES.ERROR) {
       const allowedNextStates = VALID_TRANSITIONS[currentStateName];

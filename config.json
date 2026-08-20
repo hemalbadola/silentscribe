@@ -1,7 +1,7 @@
 {
-  "version": "1.2.1",
+  "version": "1.2.2",
   "downloadUrl": "https://github.com/hemalbadola/silentscribe/releases/latest",
-  "notes": "Fixes the Settings close button, and stops the keyboard shortcut clearing itself on every reload.",
+  "notes": "Recording a Chrome page now says so plainly instead of failing with a permissions error, and a failed start no longer wedges the extension.",
   "message": "",
   "llm": {
     "provider": "nvidia",

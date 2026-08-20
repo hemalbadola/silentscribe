@@ -68,5 +68,30 @@ await setState(STATES.RECORDING);
 await updateMetadata({ transcribe: true });
 check('second recording overrides the first choice', (await getState()).transcribe === true);
 
+// ── Two callers recovering at once ──────────────────────────────────────────
+// Each caller checks the state before asking for a transition, but the queue
+// validates when the call RUNS. After a failed start left ERROR, Try Again and
+// a second press of Record both read ERROR and both queued READY — and the
+// second threw "Invalid state transition: READY → READY" out of a
+// fire-and-forget handler, where nothing caught it.
+console.log('\n[concurrent recovery]');
+await setState(STATES.READY);
+await setState(STATES.RECORDING);
+await setState(STATES.COMPLETE);
+
+let raced = null;
+await Promise.all([setState(STATES.READY), setState(STATES.READY)]).catch((e) => { raced = e; });
+check('two concurrent recoveries to READY do not throw', raced === null, raced?.message);
+check('and the state is READY', (await getState()).state === STATES.READY);
+
+const before = await getState();
+await setState(STATES.READY, { micEnabled: !before.micEnabled });
+check('a same-state call still applies its metadata',
+      (await getState()).micEnabled === !before.micEnabled);
+
+let illegal = null;
+try { await setState(STATES.COMPLETE); } catch (e) { illegal = e; }
+check('a genuinely illegal transition still rejects', illegal !== null, 'READY -> COMPLETE was allowed');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

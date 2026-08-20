@@ -116,6 +116,15 @@ const ERROR_SIGNATURES = [
     action: 'Check the connection, then check the base URL in Settings.',
   },
   {
+    // Chrome refuses to capture its own pages. The refusal it returns names the
+    // activeTab permission, which reads like something the user can grant — so
+    // people go looking for a permission that was never the problem.
+    match: /cannot be recorded|Chrome pages cannot be captured/i,
+    title: 'This tab cannot be recorded',
+    cause: 'Chrome never allows its own pages, extension pages, or the Web Store to be captured. No permission changes that.',
+    action: 'Switch to the tab with your meeting in it, then press Start Recording.',
+  },
+  {
     // The worst failure in the product: the audio did not reach the disk. It
     // must never read as a generic problem, because the recording is the one
     // thing that cannot be redone.

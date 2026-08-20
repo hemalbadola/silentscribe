@@ -225,5 +225,20 @@ check('opening settings records what it covered',
       /viewBeforeSettings = currentView/.test(panel));
 check('showView tracks the current view', /currentView = viewId/.test(panel));
 
+// ── A tab that can never be captured says so ────────────────────────────────
+console.log('\n[uncapturable tabs]');
+check('the service worker checks the tab before capturing',
+      /describeUncapturableTab/.test(sw), 'no pre-check');
+// Scoped to the function body: a file-header comment mentions getMediaStreamId
+// hundreds of lines earlier, and matching that made this compare the wrong two
+// positions entirely.
+const startBody = sw.slice(sw.indexOf('async function handleStartRecording(payload)'));
+check('and it runs before getMediaStreamId',
+      startBody.indexOf('describeUncapturableTab(activeTab.url)') <
+        startBody.indexOf('chrome.tabCapture.getMediaStreamId'),
+      'the check runs too late to help');
+check('fire-and-forget handlers report their failures',
+      /reportHandlerFailure/.test(sw), 'rejections still escape');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
