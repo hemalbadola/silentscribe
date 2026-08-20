@@ -293,6 +293,12 @@
         <video id="media-player" class="video-player" controls preload="metadata" style="width: 100%; border-radius: 8px; margin-bottom: 8px; background: #000;">
           Your browser does not support video playback.
         </video>
+        <!-- A side panel cannot enter fullscreen, so the player's own
+             fullscreen button is inert here. This opens the recording in a
+             tab, where fullscreen and downloading both work. -->
+        <button id="btn-open-in-tab" class="btn btn-ghost btn-full" type="button">
+          ⛶ Open in a tab — for fullscreen and download
+        </button>
         <div id="bookmarks-container" class="bookmarks-container">
           <!-- Bookmarks injected here -->
         </div>

@@ -259,6 +259,24 @@ export const AUDIO_CONFIG = Object.freeze({
   RECORDER_MIME_TYPE: 'video/webm;codecs=vp8,opus',
 
   /**
+   * Containers to record in, best first.
+   *
+   * MediaRecorder decides what a recording IS — there is no re-containering
+   * afterwards without shipping a transcoder, which would be tens of megabytes
+   * of WebAssembly for a format change. Chrome learned to record MP4 directly
+   * in recent versions, so ask for it and fall back where it is unavailable.
+   * MP4 is the one that opens in QuickTime, Premiere and PowerPoint without
+   * being converted first.
+   */
+  RECORDER_MIME_PREFERENCES: [
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+  ],
+
+  /**
    * MediaRecorder MIME type and codec for the microphone stream.
    * Audio-only (opus).
    */

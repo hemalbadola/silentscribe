@@ -314,6 +314,35 @@ function checkContextApis() {
 
 
 /**
+ * Every directory of runtime source is in the build's include list.
+ *
+ * dist/ is built from an explicit allowlist, so a new directory ships as a
+ * missing file — the page 404s in the release while working perfectly from a
+ * local checkout, which is the hardest kind of bug to notice.
+ */
+function checkBuildCoverage() {
+  const buildScript = join(ROOT, 'scripts/build.mjs');
+  if (!existsSync(buildScript)) return;
+
+  const include = readFileSync(buildScript, 'utf8');
+  const notRuntime = new Set(['scripts', 'tests', 'node_modules', 'dist', 'lib', '.git', '.claude']);
+
+  for (const entry of readdirSync(ROOT, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith('.') || notRuntime.has(entry.name)) continue;
+
+    // Only directories that actually hold code the extension loads.
+    const hasSource = readdirSync(join(ROOT, entry.name))
+      .some((f) => f.endsWith('.js') || f.endsWith('.html') || f.endsWith('.css'));
+    if (!hasSource) continue;
+
+    if (!new RegExp(`['"]${entry.name}['"]`).test(include)) {
+      fail('package', `${entry.name}/ holds runtime code but scripts/build.mjs does not package it.`);
+    }
+  }
+}
+
+
+/**
  * The packaged build in dist/ matches the source it was built from.
  *
  * dist/ used to be a hand copy, and the v1.1.1 release proved what that costs:
@@ -417,6 +446,7 @@ checkStyles();
 checkManifest();
 checkRuntimeAssets();
 checkContextApis();
+checkBuildCoverage();
 checkPackagedBuild();
 checkNoLeakedSecrets(files);
 

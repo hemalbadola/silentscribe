@@ -398,6 +398,7 @@ function cacheDomReferences() {
   // Settings
   dom.btnRecord       = document.getElementById('btn-record');
   dom.recordHint      = document.getElementById('record-hint');
+  dom.btnOpenInTab    = document.getElementById('btn-open-in-tab');
   dom.btnSettingsOpen  = document.getElementById('btn-settings-open');
   dom.btnSettingsClose = document.getElementById('btn-settings-close');
   dom.settingsRadios   = document.querySelectorAll('input[name="model-size"]');
@@ -650,6 +651,13 @@ function setupEventListeners() {
 
   // ── Ready View ──
   dom.btnRecord?.addEventListener('click', handleStartRecording);
+
+  // Fullscreen is not available to a side panel at all, so this hands the
+  // recording to a normal tab rather than pretending the button works.
+  dom.btnOpenInTab?.addEventListener('click', () => {
+    if (!activeSessionId) return;
+    chrome.tabs.create({ url: chrome.runtime.getURL(`player/player.html?session=${encodeURIComponent(activeSessionId)}`) });
+  });
 
   // ── Error View ──
   dom.btnDismissError.addEventListener('click', () => {
@@ -1166,7 +1174,12 @@ async function exportRecording() {
       return;
     }
 
-    triggerDownload(blob, `silentscribe-${formatDateForFilename(session?.startTime)}.webm`);
+    // Name it for what it is. Chrome records MP4 where it can and WebM where it
+    // cannot, and calling an MP4 ".webm" stops it opening in most players.
+    const recorded = session?.metadata?.primaryMimeType || blob.type || '';
+    const extension = recorded.includes('mp4') ? 'mp4' : 'webm';
+
+    triggerDownload(blob, `silentscribe-${formatDateForFilename(session?.startTime)}.${extension}`);
   } catch (err) {
     console.error(LOG_PREFIX, 'Video export failed:', err);
   }
@@ -2110,6 +2123,40 @@ function fillTranscribePrompt(emptyResult) {
 
 
 /**
+ * Make a MediaRecorder recording report its real length.
+ *
+ * MediaRecorder writes WebM without a duration in the header, because it does
+ * not know the length until recording stops and never goes back to patch it.
+ * The player therefore reports Infinity, shows 0:00, and its scrub bar does
+ * nothing at all.
+ *
+ * Seeking far past the end forces the browser to read to the last cluster and
+ * work the duration out, after which seeking behaves normally.
+ *
+ * @param {HTMLMediaElement} media - The element to fix up.
+ * @returns {void}
+ */
+function forceDurationLookup(media) {
+  if (!media) return;
+
+  const settle = () => {
+    if (media.duration !== Infinity) return;
+
+    const restore = () => {
+      media.removeEventListener('timeupdate', restore);
+      media.currentTime = 0;
+    };
+    media.addEventListener('timeupdate', restore);
+    // Any value beyond the end will do; this one cannot be a real timestamp.
+    media.currentTime = 1e101;
+  };
+
+  media.addEventListener('loadedmetadata', settle, { once: true });
+  if (media.readyState >= 1) settle();
+}
+
+
+/**
  * Set up the HTML5 audio player with the full recording blob.
  * Creates an Object URL from the assembled WebM chunks.
  *
@@ -2124,6 +2171,7 @@ async function setupAudioPlayer(sessionId) {
     if (blob && blob.size > 0) {
       audioObjectUrl = URL.createObjectURL(blob);
       dom.mediaPlayer.src = audioObjectUrl;
+      forceDurationLookup(dom.mediaPlayer);
     } else {
       dom.mediaPlayer.removeAttribute('src');
       console.warn(LOG_PREFIX, 'No audio data for session:', sessionId);
@@ -2570,11 +2618,13 @@ function triggerDownload(blob, filename) {
   document.body.appendChild(anchor);
   anchor.click();
 
-  // Cleanup after a short delay to ensure the download starts
-  setTimeout(() => {
-    URL.revokeObjectURL(url);
-    anchor.remove();
-  }, 100);
+  anchor.remove();
+
+  // 100ms was enough for a text file and far too little for a video: revoking
+  // the URL while Chrome was still reading a multi-megabyte blob cancelled the
+  // download with no error anywhere. A minute costs nothing — the blob is
+  // already in memory either way — and the page outliving it releases it too.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 

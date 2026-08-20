@@ -275,5 +275,39 @@ check('the offscreen document honours the source type',
 check('mapping desktop to the desktop source',
       /sourceType === 'desktop' \? 'desktop' : 'tab'/.test(offscreen));
 
+// ── Playback, fullscreen and download ───────────────────────────────────────
+// A side panel cannot enter fullscreen — the API is not available to it — so
+// the player's own fullscreen button is inert there and cannot be made to work.
+console.log('\n[watching a recording]');
+check('there is a way out to a real tab', /id="btn-open-in-tab"/.test(html));
+check('and it opens the player page',
+      /player\/player\.html\?session=/.test(panel), 'no player link');
+
+const player = readFileSync(join(ROOT, 'player/player.js'), 'utf8');
+check('the player reads the recording from OPFS', /readFile\(/.test(player));
+check('and offers a download', /anchor\.download/.test(player));
+
+// MediaRecorder writes no duration, so the scrub bar does nothing until forced.
+check('the panel forces a duration lookup', /forceDurationLookup/.test(panel));
+check('the player does too', /forceDurationLookup/.test(player));
+check('by seeking past the end', /1e101/.test(panel) && /1e101/.test(player));
+
+// 100ms was enough for a text file and far too little for a video.
+check('the download URL is not revoked out from under a large file',
+      !/URL\.revokeObjectURL\(url\);\s*\n\s*anchor\.remove\(\);\s*\n\s*\}, 100\)/.test(panel),
+      'still revoking after 100ms');
+
+console.log('\n[the file is named for what it is]');
+const constants = readFileSync(join(ROOT, 'utils/constants.js'), 'utf8');
+check('MP4 is preferred where the browser can record it',
+      /RECORDER_MIME_PREFERENCES[\s\S]{0,200}video\/mp4/.test(constants));
+check('with WebM still available as a fallback',
+      /RECORDER_MIME_PREFERENCES[\s\S]{0,400}video\/webm/.test(constants));
+check('the container is chosen against what is supported',
+      /isTypeSupported/.test(offscreen), 'no negotiation');
+check('and recorded on the session', /primaryMimeType/.test(offscreen));
+check('so the export can name the extension correctly',
+      /includes\('mp4'\) \? 'mp4' : 'webm'/.test(panel));
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

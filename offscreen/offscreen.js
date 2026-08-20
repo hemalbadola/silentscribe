@@ -484,9 +484,14 @@ async function beginCapture({ streamId, micEnabled, sessionId, sourceType }) {
     combinedStream.addTrack(primaryDestination.stream.getAudioTracks()[0]);
   }
 
-  recorderPrimary = new MediaRecorder(combinedStream, {
-    mimeType: AUDIO_CONFIG.RECORDER_MIME_TYPE,
-  });
+  // Ask for the best container this browser can actually record.
+  const primaryMimeType = pickRecorderMimeType(
+    AUDIO_CONFIG.RECORDER_MIME_PREFERENCES,
+    AUDIO_CONFIG.RECORDER_MIME_TYPE,
+  );
+  console.log(`[SilentScribe Offscreen] Recording as ${primaryMimeType}`);
+
+  recorderPrimary = new MediaRecorder(combinedStream, { mimeType: primaryMimeType });
 
   recorderPrimary.ondataavailable = (event) => {
     if (event.data && event.data.size > 0 && primaryWriteStream) {
@@ -548,7 +553,10 @@ async function beginCapture({ streamId, micEnabled, sessionId, sourceType }) {
     const { updateSessionMetadata } = await import('../storage/db.js');
     await updateSessionMetadata(sessionId, {
       primaryStartOffsetMs: 0,
-      micStartOffsetMs: recorderMic ? (micStartedAtPerf - primaryStartedAtPerf) : null
+      micStartOffsetMs: recorderMic ? (micStartedAtPerf - primaryStartedAtPerf) : null,
+      // What the file actually is. Exporting used to name every recording .webm
+      // regardless, which mislabels an MP4 and stops it opening.
+      primaryMimeType,
     }, null);
   } catch (err) {
     console.warn('[SilentScribe Offscreen] Failed to save session offsets:', err);
@@ -709,6 +717,27 @@ async function endCapture(options) {
 // ============================================================================
 // LIVE TRANSCRIPT PREVIEW
 // ============================================================================
+
+/**
+ * Choose the first container this browser can actually record.
+ *
+ * MediaRecorder throws on a mimeType it does not support, and what it supports
+ * varies by browser and platform. The container is fixed at record time — there
+ * is no converting afterwards without shipping a transcoder.
+ *
+ * @param {string[]} preferences - Candidates, best first.
+ * @param {string} fallback - Used when none are supported, or the check is absent.
+ * @returns {string}
+ */
+function pickRecorderMimeType(preferences, fallback) {
+  if (typeof MediaRecorder?.isTypeSupported !== 'function') return fallback;
+
+  for (const candidate of preferences || []) {
+    if (MediaRecorder.isTypeSupported(candidate)) return candidate;
+  }
+  return fallback;
+}
+
 
 /**
  * Read the settings this document needs from the service worker.

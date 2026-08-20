@@ -32,6 +32,7 @@ const INCLUDE = [
   'background',
   'content',
   'offscreen',
+  'player',
   'sidepanel',
   'storage',
   'transcription',

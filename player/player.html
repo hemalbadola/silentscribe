@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SilentScribe — Recording</title>
+  <!--
+    A side panel cannot enter fullscreen: the Fullscreen API is not available
+    to it, so the player's own fullscreen button does nothing there. This is an
+    ordinary extension page in an ordinary tab, where fullscreen, picture in
+    picture and the native download all work.
+  -->
+  <link rel="stylesheet" href="player.css">
+</head>
+<body>
+  <main class="wrap">
+    <header class="bar">
+      <h1 id="title" class="title">Recording</h1>
+      <button id="download" class="btn" type="button">Download</button>
+    </header>
+
+    <video id="video" class="video" controls autoplay playsinline></video>
+
+    <p id="status" class="status" hidden></p>
+  </main>
+  <script src="player.js" type="module"></script>
+</body>
+</html>
