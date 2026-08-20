@@ -34,7 +34,7 @@
  * @module offscreen
  */
 
-import { MSG, AUDIO_CONFIG, OFFSCREEN_CONFIG } from '../utils/constants.js';
+import { MSG, AUDIO_CONFIG, OFFSCREEN_CONFIG, WHISPER_CONFIG } from '../utils/constants.js';
 import { createWriteStream } from '../storage/opfs.js';
 
 
@@ -98,6 +98,12 @@ let levelInterval = null;
 
 /** @type {Worker|null} Transcription Web Worker running Whisper */
 let transcriptionWorker = null;
+
+/** @type {ScriptProcessorNode|null} Taps tab audio for the live preview */
+let livePreviewNode = null;
+
+/** Seconds of audio per live preview slice. */
+const LIVE_CHUNK_SECONDS = 5;
 
 // Worklets and memory-heavy PCM extraction removed for V2 architecture
 
@@ -165,7 +171,7 @@ function handleMessage(message, sender, sendResponse) {
       return true; // Async
 
     case MSG.OFFSCREEN_STOP_CAPTURE:
-      stopCapture()
+      stopCapture(message.payload)
         .then(() => sendResponse({ success: true }))
         .catch((err) => {
           console.error('[SilentScribe Offscreen] Capture stop failed:', err);
@@ -255,6 +261,9 @@ async function startCapture({ streamId, micEnabled, sessionId, sourceType }) {
   // by connecting to ctx.destination.
   tabSourceNode.connect(audioContext.destination);
 
+  // ── Step 3b: Optional live transcript preview ──────────────────────────
+  await startLivePreview(sessionId);
+
   // ── Step 4: Optionally get mic audio ───────────────────────────────────
   if (micEnabled) {
     try {
@@ -297,49 +306,8 @@ async function startCapture({ streamId, micEnabled, sessionId, sourceType }) {
     micSourceNode.connect(micAnalyser);
   }
 
-  // ── Step 7: Real-Time Audio Extraction (ScriptProcessorNode) ─────────
-  // We use ScriptProcessorNode (despite deprecation) because it's reliable
-  // inside MV3 offscreen documents where AudioWorklet external files fail CSP.
-  // We capture at 48kHz and downsample to 16kHz for Whisper.
-  
-  const bufferSize = 4096;
-  const scriptProcessor = audioContext.createScriptProcessor(bufferSize, 1, 1);
-  tabSourceNode.connect(scriptProcessor);
-  scriptProcessor.connect(audioContext.destination);
-
-  let pcmBuffer = [];
-  let samplesCollected = 0;
-  const targetSampleRate = 16000;
-  const downsampleRatio = audioContext.sampleRate / targetSampleRate;
-
-  // Initialize the worker early for real-time
-  startTranscriptionWorkerEarly(sessionId);
-
-  scriptProcessor.onaudioprocess = (e) => {
-    const inputData = e.inputBuffer.getChannelData(0);
-    
-    // Downsample to 16kHz on the fly
-    for (let i = 0; i < inputData.length; i += downsampleRatio) {
-      pcmBuffer.push(inputData[Math.floor(i)]);
-      samplesCollected++;
-    }
-
-    // Every ~5 seconds (80,000 samples at 16kHz), dispatch a chunk
-    if (samplesCollected >= targetSampleRate * 5) {
-      const chunk = new Float32Array(pcmBuffer);
-      if (transcriptionWorker) {
-        transcriptionWorker.postMessage({
-          type: 'TRANSCRIBE_CHUNK',
-          payload: { pcmChunk: chunk }
-        });
-      }
-      // Reset buffer, keeping a 1-second overlap (16,000 samples)
-      // for better word boundary handling in Whisper
-      const overlap = pcmBuffer.slice(-targetSampleRate);
-      pcmBuffer = overlap;
-      samplesCollected = overlap.length;
-    }
-  };
+  // ── Step 7: Removed AudioWorklets for V2 ─────────────────────────
+  // PCM extraction is deferred to the Intelligence Plane to avoid memory bloat.
 
   // ── Step 8: Set up Dual MediaRecorders ─────────────────────────────────
   // We must construct a combined MediaStream!
@@ -433,8 +401,11 @@ async function startCapture({ streamId, micEnabled, sessionId, sourceType }) {
  * 
  * @returns {Promise<void>}
  */
-async function stopCapture() {
-  console.log('[SilentScribe Offscreen] Stopping capture...');
+async function stopCapture(options) {
+  // The user picks at stop time whether to transcribe or just keep the video.
+  // No payload means transcribe, so the keyboard shortcut is unchanged.
+  const transcribe = options?.transcribe !== false;
+  console.log(`[SilentScribe Offscreen] Stopping capture (transcribe: ${transcribe})...`);
 
   // 1. Trigger MediaRecorder stops and await their onstop events
   const stopPromises = [];
@@ -470,6 +441,7 @@ async function stopCapture() {
 
   // Stop level meter updates
   stopLevelMeters();
+  stopLivePreview();
 
   // Close AudioContext
   if (audioContext && audioContext.state !== 'closed') {
@@ -502,8 +474,14 @@ async function stopCapture() {
     payload: { sessionId: currentSessionId },
   }).catch(() => {});
 
-  // Start offline decoding & transcription!
-  runOfflineTranscription(currentSessionId);
+  // Start offline decoding & transcription, unless the user skipped it.
+  // Skipping leaves the WebM in OPFS; the complete view offers a button to
+  // transcribe it later through the same code path.
+  if (transcribe) {
+    runOfflineTranscription(currentSessionId);
+  } else {
+    console.log('[SilentScribe Offscreen] Transcription skipped by user choice.');
+  }
 
   // Clean up references (but keep keepalive port)
   audioContext = null;
@@ -515,6 +493,116 @@ async function stopCapture() {
   micSourceNode = null;
   tabAnalyser = null;
   micAnalyser = null;
+}
+
+// ============================================================================
+// LIVE TRANSCRIPT PREVIEW
+// ============================================================================
+
+/**
+ * Feed short slices of tab audio to the transcription worker while recording,
+ * so the panel can show roughly what is being said.
+ *
+ * OFF BY DEFAULT, and deliberately so. ONNX Runtime is pinned to a single
+ * thread here (the multi-threaded backend is blocked by the extension's
+ * content security policy), so Whisper inference competes with capture for the
+ * same core. On a busy machine that risks the recording itself, which is the
+ * one thing that must not be lost. The authoritative transcript is always
+ * produced after the recording ends.
+ *
+ * @param {string} sessionId - Session being recorded.
+ * @returns {Promise<void>}
+ */
+async function startLivePreview(sessionId) {
+  const stored = await chrome.storage.local.get(['liveTranscript', 'modelSize']);
+  if (!stored.liveTranscript) return;
+
+  console.log('[SilentScribe Offscreen] Live transcript preview enabled');
+  startTranscriptionWorkerEarly(sessionId);
+  if (!transcriptionWorker) return;
+
+  const modelId = stored.modelSize || WHISPER_CONFIG.MODEL_ID;
+  const targetRate = AUDIO_CONFIG.WHISPER_SAMPLE_RATE;
+  const ratio = audioContext.sampleRate / targetRate;
+
+  // ScriptProcessorNode is deprecated, but the AudioWorklet in this extension
+  // is already dedicated to writing the recording's PCM. Adding a second
+  // consumer here keeps the preview entirely separate from the path that
+  // produces the file, so a fault in the preview cannot corrupt a recording.
+  livePreviewNode = audioContext.createScriptProcessor(4096, 1, 1);
+  tabSourceNode.connect(livePreviewNode);
+  livePreviewNode.connect(audioContext.destination);
+
+  let buffer = [];
+
+  livePreviewNode.onaudioprocess = (event) => {
+    const input = event.inputBuffer.getChannelData(0);
+    for (let i = 0; i < input.length; i += ratio) buffer.push(input[Math.floor(i)]);
+
+    if (buffer.length < targetRate * LIVE_CHUNK_SECONDS) return;
+
+    if (transcriptionWorker) {
+      transcriptionWorker.postMessage({
+        type: 'TRANSCRIBE_CHUNK',
+        payload: { pcmChunk: new Float32Array(buffer), modelId },
+      });
+    }
+
+    // Keep one second of overlap so a word split across the boundary is not
+    // lost from both slices.
+    buffer = buffer.slice(-targetRate);
+  };
+}
+
+
+/**
+ * Create the transcription worker before recording ends, so live slices have
+ * somewhere to go and the model is already warm when the real run starts.
+ *
+ * @param {string} sessionId - Session being recorded.
+ * @returns {void}
+ */
+function startTranscriptionWorkerEarly(sessionId) {
+  if (transcriptionWorker) return;
+
+  try {
+    transcriptionWorker = new Worker(
+      new URL('../transcription/transcription-worker.js', import.meta.url),
+      { type: 'module' },
+    );
+  } catch (err) {
+    console.warn('[SilentScribe Offscreen] Could not pre-start the worker:', err.message);
+    return;
+  }
+
+  transcriptionWorker.onmessage = (event) => {
+    if (event.data?.type !== 'TRANSCRIPTION_CHUNK_RESULT') return;
+    chrome.runtime.sendMessage({
+      type: MSG.TRANSCRIPTION_PROGRESS,
+      payload: { text: event.data.payload.text, isRealTime: true, sessionId },
+    }).catch(() => {});
+  };
+
+  transcriptionWorker.onerror = (err) => {
+    console.warn('[SilentScribe Offscreen] Live preview worker error:', err.message);
+  };
+}
+
+
+/**
+ * Tear down the live preview. Called when capture stops.
+ *
+ * @returns {void}
+ */
+function stopLivePreview() {
+  if (!livePreviewNode) return;
+  livePreviewNode.onaudioprocess = null;
+  try {
+    livePreviewNode.disconnect();
+  } catch {
+    // Already detached with the AudioContext.
+  }
+  livePreviewNode = null;
 }
 
 /**
@@ -554,11 +642,14 @@ async function runOfflineTranscription(sessionId) {
     if (!session) throw new Error('Session not found');
 
     const primaryBlob = await readFile(`session_${sessionId}_primary.webm`);
+    if (!primaryBlob || primaryBlob.size === 0) {
+      throw new Error('No audio was found for this recording.');
+    }
     const primaryPcm = await decodeWebM(primaryBlob);
     console.log(`[SilentScribe Offscreen] Primary WebM decoded: ${(primaryPcm.length / 16000).toFixed(2)}s`);
     
     let micPcm = new Float32Array(0);
-    if (session.files.micTrack) {
+    if (session.files?.micTrack) {
       const micBlob = await readFile(`session_${sessionId}_mic.webm`);
       micPcm = await decodeWebM(micBlob);
       console.log(`[SilentScribe Offscreen] Mic WebM decoded: ${(micPcm.length / 16000).toFixed(2)}s`);
@@ -570,8 +661,8 @@ async function runOfflineTranscription(sessionId) {
       mic: micPcm.length > 0 ? micPcm.length / 16000 : null
     });
 
-    let primaryOffsetMs = session.metadata.primaryStartOffsetMs || 0;
-    let micOffsetMs = session.metadata.micStartOffsetMs || 0;
+    let primaryOffsetMs = session.metadata?.primaryStartOffsetMs || 0;
+    let micOffsetMs = session.metadata?.micStartOffsetMs || 0;
 
     // Lightweight onset detection sanity pass
     const pOnset = findOnsetMs(primaryPcm);
@@ -613,51 +704,32 @@ async function runOfflineTranscription(sessionId) {
  * @param {number} primaryOffsetMs - Offset for the primary track in ms.
  * @param {number} micOffsetMs - Offset for the mic track in ms.
  */
-function startTranscriptionWorkerEarly(sessionId) {
-  console.log('[SilentScribe Offscreen] Pre-initializing transcription worker for real-time...');
-  try {
-    transcriptionWorker = new Worker(
-      new URL('../transcription/transcription-worker.js', import.meta.url),
-      { type: 'module' }
-    );
-  } catch (err) {
-    console.error('[SilentScribe Offscreen] Failed to create transcription worker:', err);
-    return;
-  }
-
-  transcriptionWorker.onmessage = (event) => {
-    const { type, payload } = event.data;
-
-    switch (type) {
-      case 'TRANSCRIPTION_CHUNK_RESULT':
-        // Send real-time transcript segment to the service worker/UI
-        chrome.runtime.sendMessage({
-          type: MSG.TRANSCRIPTION_PROGRESS,
-          payload: { text: payload.text, isRealTime: true }
-        }).catch(() => {});
-        break;
-      case 'TRANSCRIPTION_PROGRESS':
-        chrome.runtime.sendMessage({ type: MSG.TRANSCRIPTION_PROGRESS, payload }).catch(() => {});
-        break;
-    }
-  };
-}
-
-function startTranscription(tabPcm, micPcm, sessionId, primaryOffsetMs = 0, micOffsetMs = 0) {
+async function startTranscription(tabPcm, micPcm, sessionId, primaryOffsetMs = 0, micOffsetMs = 0) {
   console.log('[SilentScribe Offscreen] Starting dual-track transcription worker...');
 
-  try {
-    transcriptionWorker = new Worker(
-      new URL('../transcription/transcription-worker.js', import.meta.url),
-      { type: 'module' }
-    );
-  } catch (err) {
-    console.error('[SilentScribe Offscreen] Failed to create transcription worker:', err);
-    chrome.runtime.sendMessage({
-      type: MSG.TRANSCRIPTION_ERROR,
-      payload: { error: 'Failed to initialize transcription engine: ' + err.message },
-    }).catch(() => {});
-    return;
+  // Reuse the worker the live preview pre-warmed, when there is one: its model
+  // is already loaded, which is nearly all of the startup cost. Its onmessage
+  // is replaced below, so the live-chunk handler does not survive.
+  //
+  // Only one worker may exist at a time. Dropping the handle to a running one
+  // would leak a thread still holding a loaded Whisper model.
+  const reusable = Boolean(transcriptionWorker);
+  if (reusable) {
+    console.log('[SilentScribe Offscreen] Reusing the pre-warmed transcription worker');
+  } else {
+    try {
+      transcriptionWorker = new Worker(
+        new URL('../transcription/transcription-worker.js', import.meta.url),
+        { type: 'module' }
+      );
+    } catch (err) {
+      console.error('[SilentScribe Offscreen] Failed to create transcription worker:', err);
+      chrome.runtime.sendMessage({
+        type: MSG.TRANSCRIPTION_ERROR,
+        payload: { error: 'Failed to initialize transcription engine: ' + err.message },
+      }).catch(() => {});
+      return;
+    }
   }
 
   // Store PCM references for diarization after transcription
@@ -710,6 +782,12 @@ function startTranscription(tabPcm, micPcm, sessionId, primaryOffsetMs = 0, micO
     }).catch(() => {});
   };
 
+  // The accuracy setting lives in chrome.storage.local. The worker has no
+  // chrome API access, so the model id travels in the message payload.
+  const stored = await chrome.storage.local.get('modelSize');
+  const modelId = stored.modelSize || WHISPER_CONFIG.MODEL_ID;
+  console.log(`[SilentScribe Offscreen] Transcribing with model: ${modelId}`);
+
   // Start the transcription process with BOTH buffers.
   // The worker will transcribe them sequentially and merge them.
   transcriptionWorker.postMessage(
@@ -722,6 +800,7 @@ function startTranscription(tabPcm, micPcm, sessionId, primaryOffsetMs = 0, micO
         primaryOffsetMs,
         micOffsetMs,
         sampleRate: AUDIO_CONFIG.CONTEXT_SAMPLE_RATE,
+        modelId,
       },
     },
     [tabPcm.buffer, micPcm.buffer].filter(buf => buf.byteLength > 0) // Zero-copy transfer
@@ -743,35 +822,15 @@ function startTranscription(tabPcm, micPcm, sessionId, primaryOffsetMs = 0, micO
 async function handleManualTranscription(payload) {
   console.log(`[SilentScribe Offscreen] Manual transcription for session: ${payload.sessionId}`);
 
-  try {
-    const { getTranscript } = await import('../storage/db.js');
-    const { readFile } = await import('../storage/opfs.js');
-    const audioBlob = await readFile(`session_${payload.sessionId}_primary.webm`);
-    if (!audioBlob || audioBlob.size === 0) {
-      throw new Error('No audio data found for this session');
-    }
-
-    // Decode WebM to PCM using AudioContext
-    const arrayBuffer = await audioBlob.arrayBuffer();
-    const decodeCtx = new AudioContext({ sampleRate: AUDIO_CONFIG.WHISPER_SAMPLE_RATE });
-    const audioBuffer = await decodeCtx.decodeAudioData(arrayBuffer);
-
-    // Extract mono channel
-    const pcm = audioBuffer.getChannelData(0);
-    await decodeCtx.close();
-
-    currentSessionId = payload.sessionId;
-
-    // Start transcription with tab-only PCM (no mic separation for past recordings)
-    startTranscription(pcm, new Float32Array(0));
-
-  } catch (err) {
-    console.error('[SilentScribe Offscreen] Manual transcription failed:', err);
-    chrome.runtime.sendMessage({
-      type: MSG.TRANSCRIPTION_ERROR,
-      payload: { error: err.message },
-    }).catch(() => {});
-  }
+  // Do not touch currentSessionId. Transcription now runs in the background,
+  // so a recording may be in progress and that variable belongs to it —
+  // overwriting it would file the new recording's audio under the wrong id.
+  // runOfflineTranscription takes the session explicitly.
+  //
+  // Reuse the same path the automatic run takes. The earlier version decoded
+  // only the primary track here, which silently dropped the microphone track
+  // and with it the "Me" vs "Others" speaker split.
+  await runOfflineTranscription(payload.sessionId);
 }
 
 

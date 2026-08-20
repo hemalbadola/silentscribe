@@ -1,1 +1,23 @@
+# Secrets — never commit
 .env
+*.env
+.claude/.env
+.claude/*.env
+
+# Generated from .claude/.env by scripts/build-config.mjs.
+# Contains the bundled API key. Regenerate it; do not commit it.
+utils/managed-config.js
+
+# Packaging output
+*.crx
+*.pem
+dist/
+
+node_modules/
+.DS_Store
+
+# Local agent state — also holds .claude/.env with the API key
+.claude/
+
+# macOS
+**/.DS_Store

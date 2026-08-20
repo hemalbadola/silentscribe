@@ -1,5 +1,20 @@
 {
   "dependencies": {
     "@xenova/transformers": "^2.17.2"
+  },
+  "name": "silentscribe",
+  "version": "1.1.0",
+  "description": "Privacy-first Chrome extension: records browser audio and transcribes it on-device with Whisper.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hemalbadola/silentscribe.git"
+  },
+  "scripts": {
+    "check": "node scripts/check.mjs",
+    "test": "node scripts/test.mjs",
+    "setup": "./setup.sh"
   }
 }

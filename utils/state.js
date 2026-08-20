@@ -27,8 +27,11 @@
  * 
  * Lifecycle:
  *   IDLE → PERMISSIONS_NEEDED → READY → RECORDING → PROCESSING → COMPLETE
- *                                 ↑                                    │
- *                                 └────────────────────────────────────┘
+ *                                 ↑                 │              ↑  │
+ *                                 │                 └──────────────┘  │
+ *                                 │            (stop without transcribing)
+ *                                 └───────────────────────────────────┘
+ *   COMPLETE → PROCESSING when the user transcribes a saved recording.
  *   Any state → ERROR → READY (on dismiss)
  * 
  * @enum {string}
@@ -69,17 +72,27 @@ export const STATES = Object.freeze({
  * The ERROR state is reachable from ANY state (not listed explicitly to
  * avoid repetition — handled in the transition validator).
  * 
+ * The table has a NULL PROTOTYPE on purpose. A corrupt stored state named
+ * after an Object.prototype member ('toString', 'constructor', ...) would
+ * otherwise resolve to an inherited function, and the validator below would
+ * throw "includes is not a function" instead of the intended
+ * "Invalid state transition" error.
+ *
  * @type {Object<string, string[]>}
  */
-const VALID_TRANSITIONS = Object.freeze({
+const VALID_TRANSITIONS = Object.freeze(Object.assign(Object.create(null), {
   [STATES.IDLE]:                [STATES.PERMISSIONS_NEEDED, STATES.READY],
   [STATES.PERMISSIONS_NEEDED]:  [STATES.READY],
   [STATES.READY]:               [STATES.RECORDING],
-  [STATES.RECORDING]:           [STATES.PROCESSING, STATES.READY],
+  // RECORDING → COMPLETE is the "save the video, skip transcription" stop.
+  // Nothing needs processing, so the session goes straight to playback.
+  [STATES.RECORDING]:           [STATES.PROCESSING, STATES.READY, STATES.COMPLETE],
   [STATES.PROCESSING]:          [STATES.COMPLETE, STATES.READY],
-  [STATES.COMPLETE]:            [STATES.READY],
+  // COMPLETE → PROCESSING is the "transcribe this recording now" button,
+  // used both for skipped recordings and to re-transcribe an old one.
+  [STATES.COMPLETE]:            [STATES.READY, STATES.PROCESSING],
   [STATES.ERROR]:               [STATES.READY],
-});
+}));
 
 
 // ============================================================================
@@ -88,6 +101,43 @@ const VALID_TRANSITIONS = Object.freeze({
 
 /** Key used in chrome.storage.session to store the current state object. */
 const STATE_STORAGE_KEY = 'silentscribe_state';
+
+
+// ============================================================================
+// MUTATION QUEUE
+// ============================================================================
+
+/**
+ * Tail of the serialised mutation chain. Every read-modify-write waits on it.
+ *
+ * The service worker is the only writer, but it is still concurrent: several
+ * async handlers (hotkey, side panel message, offscreen message, port
+ * disconnect) can be in flight at once. Without serialisation two callers read
+ * the SAME stored state, both validate against that stale snapshot, and the
+ * second write wins — completing a transition VALID_TRANSITIONS forbids, or
+ * silently erasing the first caller's metadata.
+ *
+ * @type {Promise<void>}
+ */
+let mutationQueue = Promise.resolve();
+
+
+/**
+ * Run a read-modify-write after every mutation queued before it, so it reads
+ * the state the previous mutation actually wrote.
+ *
+ * The tail is advanced with a swallowed catch: a rejected mutation (an invalid
+ * transition throws) must not wedge every mutation queued behind it. The
+ * caller still receives the rejection through the returned promise.
+ *
+ * @param {function(): Promise<*>} mutator - The read-modify-write to run.
+ * @returns {Promise<*>} Settles with the mutator's own result.
+ */
+function enqueue(mutator) {
+  const result = mutationQueue.then(mutator);
+  mutationQueue = result.catch(() => {});
+  return result;
+}
 
 
 // ============================================================================
@@ -135,45 +185,50 @@ export async function getState() {
  * @returns {Promise<void>}
  */
 export async function setState(newState, metadata = {}) {
-  const current = await getState();
-  const currentStateName = current.state;
+  // Queued, because read → validate → write is not atomic. A queued call is
+  // validated when it RUNS, not when it was made, so a transition that has
+  // become illegal in the meantime rejects exactly as a sequential call does.
+  return enqueue(async () => {
+    const current = await getState();
+    const currentStateName = current.state;
 
-  // ERROR is reachable from any state — special case
-  if (newState !== STATES.ERROR) {
-    const allowedNextStates = VALID_TRANSITIONS[currentStateName];
-    if (!allowedNextStates || !allowedNextStates.includes(newState)) {
-      throw new Error(
-        `[SilentScribe] Invalid state transition: ${currentStateName} → ${newState}. ` +
-        `Allowed transitions from ${currentStateName}: [${(allowedNextStates || []).join(', ')}]`
-      );
+    // ERROR is reachable from any state — special case
+    if (newState !== STATES.ERROR) {
+      const allowedNextStates = VALID_TRANSITIONS[currentStateName];
+      if (!allowedNextStates || !allowedNextStates.includes(newState)) {
+        throw new Error(
+          `[SilentScribe] Invalid state transition: ${currentStateName} → ${newState}. ` +
+          `Allowed transitions from ${currentStateName}: [${(allowedNextStates || []).join(', ')}]`
+        );
+      }
     }
-  }
 
-  // Build the new state object, preserving metadata from the current state
-  // unless explicitly overridden
-  const newStateObject = {
-    ...current,
-    ...metadata,
-    state: newState,
-    lastTransitionTime: Date.now(),
-  };
+    // Build the new state object, preserving metadata from the current state
+    // unless explicitly overridden
+    const newStateObject = {
+      ...current,
+      ...metadata,
+      state: newState,
+      lastTransitionTime: Date.now(),
+    };
 
-  // Clear error when leaving ERROR state
-  if (currentStateName === STATES.ERROR && newState !== STATES.ERROR) {
-    newStateObject.error = null;
-  }
+    // Clear error when leaving ERROR state
+    if (currentStateName === STATES.ERROR && newState !== STATES.ERROR) {
+      newStateObject.error = null;
+    }
 
-  // Clear session data when returning to READY
-  if (newState === STATES.READY) {
-    newStateObject.recordingStartTime = null;
-    // sessionId is preserved so the side panel can still show the last session
-  }
+    // Clear session data when returning to READY
+    if (newState === STATES.READY) {
+      newStateObject.recordingStartTime = null;
+      // sessionId is preserved so the side panel can still show the last session
+    }
 
-  await chrome.storage.session.set({ [STATE_STORAGE_KEY]: newStateObject });
+    await chrome.storage.session.set({ [STATE_STORAGE_KEY]: newStateObject });
 
-  // Broadcast state change to all extension contexts
-  // (side panel, offscreen doc, content scripts)
-  broadcastState(newStateObject);
+    // Broadcast state change to all extension contexts
+    // (side panel, offscreen doc, content scripts)
+    broadcastState(newStateObject);
+  });
 }
 
 
@@ -185,10 +240,14 @@ export async function setState(newState, metadata = {}) {
  * @returns {Promise<void>}
  */
 export async function updateMetadata(metadata) {
-  const current = await getState();
-  const updated = { ...current, ...metadata };
-  await chrome.storage.session.set({ [STATE_STORAGE_KEY]: updated });
-  broadcastState(updated);
+  // Queued alongside setState: this is the same read-modify-write, so an
+  // unqueued update would overwrite a transition that landed after its read.
+  return enqueue(async () => {
+    const current = await getState();
+    const updated = { ...current, ...metadata };
+    await chrome.storage.session.set({ [STATE_STORAGE_KEY]: updated });
+    broadcastState(updated);
+  });
 }
 
 /**

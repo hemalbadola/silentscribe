@@ -44,6 +44,35 @@
 let whisperPipeline = null;
 
 /**
+ * Default Whisper model, used when the caller sends no `modelId`.
+ * Kept in sync with WHISPER_CONFIG.MODEL_ID in utils/constants.js — this worker
+ * cannot import that module, because it must stay loadable before the
+ * transformers library resolves.
+ *
+ * @type {string}
+ */
+const DEFAULT_MODEL_ID = 'Xenova/whisper-base';
+
+/**
+ * The model id the cached pipeline was built from. Used to detect that the user
+ * changed the accuracy setting and the pipeline must be rebuilt.
+ *
+ * @type {string|null}
+ */
+let loadedModelId = null;
+
+/**
+ * True while a live chunk is being transcribed.
+ *
+ * Chunks arrive every few seconds but inference on one thread can take longer
+ * than that. Without this guard the queue would grow without bound and starve
+ * the recording it is supposed to be previewing.
+ *
+ * @type {boolean}
+ */
+let chunkBusy = false;
+
+/**
  * Whether the library has been successfully loaded.
  * @type {boolean}
  */
@@ -122,6 +151,45 @@ async function loadLibrary() {
 // ============================================================================
 
 /**
+ * Configure ONNX Runtime so it can run inside a Manifest V3 extension.
+ *
+ * Two defaults are wrong here and both are fatal:
+ *
+ * 1. THREADED WASM SPAWNS A BLOB WORKER. ONNX Runtime's multi-threaded backend
+ *    builds its worker from a Blob URL and calls importScripts() on it. The MV3
+ *    content security policy is `script-src 'self' 'wasm-unsafe-eval'`, which
+ *    does not permit blob: scripts, and MV3 forbids adding blob: to that
+ *    policy. The load fails with:
+ *      NetworkError: Failed to execute 'importScripts' on 'WorkerGlobalScope'
+ *    Pinning to a single thread means the worker is never created. Inference
+ *    is slower, but it runs at all, which single-threaded WASM does correctly.
+ *
+ * 2. THE .wasm IS FETCHED FROM A CDN. By default the runtime downloads about
+ *    10 MB from jsdelivr on every cold start, so transcription needs the
+ *    network and breaks whenever the CDN is unreachable. The binaries ship in
+ *    lib/, so point the loader at the extension's own copy. The URL is derived
+ *    from this worker's own location because chrome.runtime is not dependable
+ *    inside a dedicated worker.
+ *
+ * @param {Object} env - The `env` export from @xenova/transformers.
+ * @returns {void}
+ */
+function configureOnnxRuntime(env) {
+  const wasm = env.backends?.onnx?.wasm;
+  if (!wasm) {
+    console.warn('[Transcription Worker] ONNX wasm settings not found; using defaults');
+    return;
+  }
+
+  wasm.numThreads = 1;
+  wasm.proxy = false;
+  wasm.wasmPaths = new URL('../lib/', self.location.href).href;
+
+  console.log(`[Transcription Worker] ONNX configured: 1 thread, wasm from ${wasm.wasmPaths}`);
+}
+
+
+/**
  * Load the Whisper model or reuse a cached instance.
  * 
  * On first run, this downloads the model weights (~75MB for whisper-tiny)
@@ -133,10 +201,16 @@ async function loadLibrary() {
  * @returns {Promise<Object>} The loaded Whisper pipeline.
  * @throws {Error} If model loading fails.
  */
-async function loadModel() {
-  if (whisperPipeline) {
+async function loadModel(modelId = DEFAULT_MODEL_ID) {
+  // A different model than the cached one means the pipeline must be rebuilt.
+  if (whisperPipeline && loadedModelId === modelId) {
     console.log('[Transcription Worker] Reusing cached Whisper pipeline');
     return whisperPipeline;
+  }
+  if (whisperPipeline) {
+    console.log(`[Transcription Worker] Model changed to ${modelId} — rebuilding pipeline`);
+    await whisperPipeline.dispose?.();
+    whisperPipeline = null;
   }
 
   if (!libraryLoaded) {
@@ -151,13 +225,14 @@ async function loadModel() {
     // Allow running in a worker context
     envConfig.allowLocalModels = false;
     envConfig.useBrowserCache = true;
+    configureOnnxRuntime(envConfig);
   }
 
   try {
     // Create the ASR pipeline with progress callback
     whisperPipeline = await pipelineFn(
       'automatic-speech-recognition',
-      'Xenova/whisper-tiny',
+      modelId,
       {
         progress_callback: (progressData) => {
           // progressData can be: { status, name, file, progress, loaded, total }
@@ -174,7 +249,8 @@ async function loadModel() {
       }
     );
 
-    console.log('[Transcription Worker] Whisper pipeline loaded successfully');
+    loadedModelId = modelId;
+    console.log(`[Transcription Worker] Whisper pipeline loaded successfully (${modelId})`);
     return whisperPipeline;
 
   } catch (err) {
@@ -202,13 +278,14 @@ async function loadModel() {
  * 
  * @param {Float32Array} pcmData - 16kHz mono PCM audio data.
  * @param {string} sessionId - Session ID for tagging the result.
+ * @param {string} [modelId] - Whisper model to use. Defaults to DEFAULT_MODEL_ID.
  * @returns {Promise<Object[]>} Array of transcript segments:
  *   [{start: number, end: number, text: string, confidence?: number}]
  */
-async function transcribe(pcmData, sessionId) {
+async function transcribe(pcmData, sessionId, modelId) {
   console.log(`[Transcription Worker] Starting transcription — ${pcmData.length} samples (${(pcmData.length / 16000).toFixed(1)}s of audio)`);
 
-  const pipeline = await loadModel();
+  const pipeline = await loadModel(modelId);
   postProgress(0.45, 'Transcribing audio...');
 
   try {
@@ -219,11 +296,6 @@ async function transcribe(pcmData, sessionId) {
       chunk_length_s: 30,
       stride_length_s: 5,
       language: null, // Auto-detect language
-      
-      // Hallucination mitigation:
-      repetition_penalty: 1.1,
-      no_repeat_ngram_size: 4,
-
       callback_function: (beams) => {
         tokensGenerated++;
         // Very rough estimate: each token adds a tiny bit of progress
@@ -264,19 +336,6 @@ async function transcribe(pcmData, sessionId) {
     // Filter out segments that are just whitespace or very short
     segments = segments.filter((seg) => seg.text.length > 1);
 
-    // Filter out repetitive hallucinations (exact consecutive duplicates)
-    const cleanedSegments = [];
-    let lastText = null;
-    for (const seg of segments) {
-      // Basic normalization for comparison (lowercase, remove punctuation)
-      const normalizedText = seg.text.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim();
-      if (normalizedText !== lastText) {
-        cleanedSegments.push(seg);
-        lastText = normalizedText;
-      }
-    }
-    segments = cleanedSegments;
-
     console.log(`[Transcription Worker] Transcription complete — ${segments.length} segments`);
     postProgress(1.0, 'Complete');
 
@@ -314,23 +373,30 @@ self.onmessage = async function handleWorkerMessage(event) {
     return;
   }
 
+  // Live transcription: one short slice of audio while recording continues.
+  // Deliberately best-effort — a failed slice is skipped rather than reported,
+  // because the authoritative transcript is produced after the recording ends
+  // and a live preview must never interfere with capture.
   if (type === 'TRANSCRIBE_CHUNK') {
+    if (chunkBusy) return;
+    chunkBusy = true;
+
     try {
-      const { pcmChunk } = payload;
-      const pipeline = await loadModel();
-      const result = await pipeline(pcmChunk, {
-        language: null, // Auto-detect
+      const pipeline = await loadModel(payload.modelId);
+      const result = await pipeline(payload.pcmChunk, {
+        language: null,
         task: 'transcribe',
-        chunk_length_s: 30, // Helps with boundaries
+        chunk_length_s: 30,
       });
-      if (result && result.text && result.text.trim().length > 0) {
-        postMessage({
-          type: 'TRANSCRIPTION_CHUNK_RESULT',
-          payload: { text: result.text.trim() }
-        });
+
+      const text = String(result?.text || '').trim();
+      if (text) {
+        self.postMessage({ type: 'TRANSCRIPTION_CHUNK_RESULT', payload: { text } });
       }
     } catch (err) {
-      console.error('[Transcription Worker] Chunk error', err);
+      console.warn('[Transcription Worker] Live chunk failed:', err.message);
+    } finally {
+      chunkBusy = false;
     }
     return;
   }
@@ -340,7 +406,7 @@ self.onmessage = async function handleWorkerMessage(event) {
     return;
   }
 
-  const { sessionId, primaryPcmData, micPcmData, primaryOffsetMs, micOffsetMs, sampleRate } = payload;
+  const { sessionId, primaryPcmData, micPcmData, primaryOffsetMs, micOffsetMs, sampleRate, modelId } = payload;
 
   try {
     const primaryPcm = new Float32Array(primaryPcmData);
@@ -350,7 +416,7 @@ self.onmessage = async function handleWorkerMessage(event) {
     // 1. Transcribe Primary Track (Desktop/Others)
     if (primaryPcm.length >= sampleRate * 0.5) {
       console.log(`[Transcription Worker] Processing Primary Track...`);
-      const primarySegments = await transcribe(primaryPcm, sessionId);
+      const primarySegments = await transcribe(primaryPcm, sessionId, modelId);
       
       // Apply offset and hard speaker label
       primarySegments.forEach(seg => {
@@ -365,7 +431,7 @@ self.onmessage = async function handleWorkerMessage(event) {
     if (micPcm.length >= sampleRate * 0.5) {
       console.log(`[Transcription Worker] Processing Mic Track...`);
       // Re-initialize progress or just let it overwrite
-      const micSegments = await transcribe(micPcm, sessionId);
+      const micSegments = await transcribe(micPcm, sessionId, modelId);
       
       // Apply offset and hard speaker label
       micSegments.forEach(seg => {
@@ -376,9 +442,12 @@ self.onmessage = async function handleWorkerMessage(event) {
       allSegments.push(...micSegments);
     }
 
+    // No speech is a valid outcome, not a failure. Posting an error here sent
+    // the extension to the ERROR view and invited the user to retry, which
+    // would produce the same empty result every time. Return an empty
+    // transcript instead; the recording is still saved and playable.
     if (allSegments.length === 0) {
-      postError('No speech detected in either track.');
-      return;
+      console.log('[Transcription Worker] No speech detected — returning an empty transcript.');
     }
 
     // 3. Merge and sort chronologically

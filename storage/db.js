@@ -276,7 +276,49 @@ export async function finalizeSession(sessionId) {
 
 
 export async function getSession(sessionId) {
-  return withStore(STORES.SESSIONS, 'readonly', (store) => store.get(sessionId));
+  const session = await withStore(STORES.SESSIONS, 'readonly', (store) => store.get(sessionId));
+  return normalizeSession(session);
+}
+
+
+/**
+ * Map records written by older versions onto the current field names.
+ *
+ * Two fields were renamed after records already existed on disk: AI notes moved
+ * from `aiSummary` to `aiInsights`, and bookmark positions moved from `time`
+ * (ambiguous units) to `timeMs`. Reading through this function means old
+ * sessions keep working without a schema migration.
+ *
+ * @param {Object|undefined} session - Raw record from IndexedDB.
+ * @returns {Object|undefined} The record with current field names.
+ */
+function normalizeSession(session) {
+  if (!session || typeof session !== 'object') return session;
+
+  // Copy rather than mutate: callers hold the object they passed in, and
+  // silently growing it made the migration look like stored data.
+  const normalized = { ...session };
+
+  // An empty string is not a note. Treating it as one left old aiSummary
+  // content permanently hidden.
+  if (!normalized.aiInsights && normalized.aiSummary) {
+    normalized.aiInsights = normalized.aiSummary;
+  }
+
+  if (Array.isArray(normalized.bookmarks)) {
+    // A single null entry used to throw here, which made the whole session
+    // impossible to open. Drop unusable entries instead.
+    normalized.bookmarks = normalized.bookmarks
+      .filter((bookmark) => bookmark && typeof bookmark === 'object')
+      .map((bookmark) => (
+        bookmark.timeMs == null && bookmark.time != null
+          ? { ...bookmark, timeMs: bookmark.time }
+          : bookmark
+      ))
+      .filter((bookmark) => Number.isFinite(Number(bookmark.timeMs)));
+  }
+
+  return normalized;
 }
 
 /**
@@ -307,11 +349,13 @@ export async function updateSessionMetadata(sessionId, metadataUpdates, duration
   if (metadataUpdates) {
     session.metadata = { ...session.metadata, ...metadataUpdates };
   }
+  // "Transcribe now" reaches this for older records too, which may predate
+  // some of these fields — guard rather than throw mid-transcription.
   if (durationUpdates) {
-    if (durationUpdates.primary !== undefined) {
+    if (durationUpdates.primary !== undefined && session.files?.primaryMedia) {
       session.files.primaryMedia.durationSeconds = durationUpdates.primary;
     }
-    if (durationUpdates.mic !== undefined && session.files.micTrack) {
+    if (durationUpdates.mic !== undefined && session.files?.micTrack) {
       session.files.micTrack.durationSeconds = durationUpdates.mic;
     }
   }
@@ -319,12 +363,43 @@ export async function updateSessionMetadata(sessionId, metadataUpdates, duration
   await withStore(STORES.SESSIONS, 'readwrite', (store) => store.put(session));
 }
 
+/**
+ * Replace a session's platform label.
+ *
+ * Used by the "regenerate metadata" action, which asks the model to infer what
+ * kind of recording this is when URL-based detection got it wrong or returned
+ * nothing.
+ *
+ * @param {string} sessionId - The session ID.
+ * @param {string} platform - The new platform label.
+ * @returns {Promise<void>}
+ */
 export async function updateSessionPlatform(sessionId, platform) {
   const session = await getSession(sessionId);
   if (!session) return;
   session.platform = platform;
   await withStore(STORES.SESSIONS, 'readwrite', (store) => store.put(session));
 }
+
+
+/**
+ * Set a session's display title.
+ *
+ * `formatSessionTitle` in the side panel prefers `meetingTitle` and falls back
+ * to platform plus date, so writing this is what makes a recording show a real
+ * name in the list.
+ *
+ * @param {string} sessionId - The session ID.
+ * @param {string} meetingTitle - The new title.
+ * @returns {Promise<void>}
+ */
+export async function updateSessionMeetingTitle(sessionId, meetingTitle) {
+  const session = await getSession(sessionId);
+  if (!session) return;
+  session.meetingTitle = meetingTitle;
+  await withStore(STORES.SESSIONS, 'readwrite', (store) => store.put(session));
+}
+
 
 /**
  * Get all sessions, ordered by most recent first.
@@ -420,7 +495,12 @@ export async function saveTranscript(sessionId, segments) {
     sessionId,
     segments,
     createdAt: Date.now(),
-    wordCount: segments.reduce((sum, s) => sum + s.text.split(/\s+/).length, 0),
+    // A segment with no text used to throw here, on the one path that runs
+    // right after a long transcription. Count only real words.
+    wordCount: segments.reduce(
+      (sum, s) => sum + String(s?.text || '').trim().split(/\s+/).filter(Boolean).length,
+      0,
+    ),
   };
 
   await withStore(STORES.TRANSCRIPTS, 'readwrite', (store) => store.put(record));
@@ -602,7 +682,10 @@ export async function saveAiInsights(sessionId, markdownNotes) {
   const session = await getSession(sessionId);
   if (!session) return;
 
-  session.aiSummary = markdownNotes;
+  // The side panel reads `aiInsights`. Older records may carry the previous
+  // `aiSummary` field, so getSession() maps it forward on read.
+  session.aiInsights = markdownNotes;
+  session.aiGeneratedAt = Date.now();
   await withStore(STORES.SESSIONS, 'readwrite', (store) => store.put(session));
 }
 
@@ -611,22 +694,22 @@ export async function saveAiInsights(sessionId, markdownNotes) {
  * Add a bookmark to a specific timestamp in the session.
  * 
  * @param {string} sessionId - The session ID.
- * @param {number} time - The timestamp in seconds.
+ * @param {number} timeMs - The playback position, in milliseconds.
  * @param {string} label - A label for the bookmark.
  * @returns {Promise<void>}
  */
-export async function addBookmark(sessionId, time, label = 'Bookmark') {
+export async function addBookmark(sessionId, timeMs, label = 'Bookmark') {
   const session = await getSession(sessionId);
   if (!session) return;
 
   if (!session.bookmarks) session.bookmarks = [];
-  
+
   // Prevent duplicate exact bookmarks
-  const exists = session.bookmarks.some(b => b.time === time);
+  const exists = session.bookmarks.some(b => b.timeMs === timeMs);
   if (!exists) {
-    session.bookmarks.push({ time, label, createdAt: Date.now() });
+    session.bookmarks.push({ timeMs, label, createdAt: Date.now() });
     // Keep bookmarks sorted chronologically
-    session.bookmarks.sort((a, b) => a.time - b.time);
+    session.bookmarks.sort((a, b) => a.timeMs - b.timeMs);
     await withStore(STORES.SESSIONS, 'readwrite', (store) => store.put(session));
   }
 }
@@ -635,14 +718,14 @@ export async function addBookmark(sessionId, time, label = 'Bookmark') {
  * Remove a bookmark by timestamp.
  * 
  * @param {string} sessionId - The session ID.
- * @param {number} time - The timestamp of the bookmark to remove.
+ * @param {number} timeMs - The playback position of the bookmark to remove.
  * @returns {Promise<void>}
  */
-export async function removeBookmark(sessionId, time) {
+export async function removeBookmark(sessionId, timeMs) {
   const session = await getSession(sessionId);
   if (!session || !session.bookmarks) return;
 
-  session.bookmarks = session.bookmarks.filter(b => b.time !== time);
+  session.bookmarks = session.bookmarks.filter(b => b.timeMs !== timeMs);
   await withStore(STORES.SESSIONS, 'readwrite', (store) => store.put(session));
 }
 

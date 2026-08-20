@@ -22,6 +22,8 @@ import {
   getSession,
   getTranscript,
   updateSpeakerNames,
+  updateSessionPlatform,
+  updateSessionMeetingTitle,
   updateTranscriptSegment,
   mergeTranscriptSegments,
   splitTranscriptSegment,
@@ -29,12 +31,27 @@ import {
   addBookmark,
   removeBookmark,
   deleteSession,
-  updateSessionPlatform,
-  updateSessionMetadata
 } from '../storage/db.js';
 import { readFile } from '../storage/opfs.js';
 import { exportTxt, exportSrt, exportJson, exportMd } from '../utils/export.js';
-import { generateAiNotes, generateAiPlatform, generateAiTitle } from '../utils/ai.js';
+import {
+  generateAiNotes,
+  checkAiAvailability,
+  generateAiTitle,
+  generateAiPlatform,
+} from '../utils/ai.js';
+import { renderMarkdown } from '../utils/markdown.js';
+import { collectDiagnostics, explainError } from '../utils/diagnostics.js';
+import {
+  PROVIDERS,
+  WIRE_FORMATS,
+  getLlmConfig,
+  setLlmConfig,
+  listModels,
+  testConnection,
+} from '../utils/llm.js';
+import { initShortcutSetup } from './shortcut-setup.js';
+import { renderOnboarding, isOnboardingComplete, resetOnboarding } from './onboarding.js';
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -43,6 +60,9 @@ import { generateAiNotes, generateAiPlatform, generateAiTitle } from '../utils/a
 
 /** Prefix for all console output from this module. */
 const LOG_PREFIX = '[SilentScribe Panel]';
+
+/** Slices kept in the live transcript before the oldest are dropped. */
+const LIVE_TRANSCRIPT_MAX_SLICES = 40;
 
 /**
  * Maps each extension state to the corresponding view element ID.
@@ -56,7 +76,9 @@ const STATE_VIEW_MAP = {
   [STATES.PERMISSIONS_NEEDED]: 'view-onboarding',
   [STATES.READY]:              'view-ready',
   [STATES.RECORDING]:          'view-recording',
-  [STATES.PROCESSING]:         'view-processing',
+  // There is no transcription screen: the recording plays while the
+  // transcript is generated behind it. A stale PROCESSING state lands here too.
+  [STATES.PROCESSING]:         'view-complete',
   [STATES.COMPLETE]:           'view-complete',
   [STATES.ERROR]:              'view-error',
 };
@@ -133,6 +155,45 @@ let audioObjectUrl = null;
  */
 const dom = {};
 
+/**
+ * AbortController for the note generation currently running, or null.
+ * Lets the Cancel button stop a long map-reduce run mid-way.
+ *
+ * @type {AbortController|null}
+ */
+let aiRunController = null;
+
+/**
+ * Session whose transcription is running in the background, or null.
+ * Mirrored from extension state so the transcript tab can show progress for
+ * the session on screen and nothing for any other.
+ *
+ * @type {string|null}
+ */
+let transcribingSessionId = null;
+
+/**
+ * Message from the last failed transcription, or null.
+ *
+ * @type {string|null}
+ */
+let transcriptionError = null;
+
+/**
+ * Results of the last diagnostics run, kept so Copy report can serialise them.
+ *
+ * @type {Object[]|null}
+ */
+let lastDiagnostics = null;
+
+/**
+ * True while a metadata regeneration is in flight, so the chip cannot be
+ * clicked into two concurrent runs.
+ *
+ * @type {boolean}
+ */
+let regeneratingMetadata = false;
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INITIALIZATION
@@ -155,20 +216,32 @@ async function initialize() {
   cacheDomReferences();
   setupEventListeners();
   setupMessageListener();
+  // Fire and forget. The module handles its own failures, but the call is
+  // unawaited, so catch here too rather than risk an unhandled rejection.
+  initShortcutSetup(document.getElementById('shortcut-setup'))
+    .catch((err) => console.warn(LOG_PREFIX, 'Shortcut card failed to render:', err));
 
   try {
     const state = await getState();
     console.log(LOG_PREFIX, 'Current state:', state.state);
     
-    // Fast-forward past onboarding if previously completed
-    if (state.state === STATES.IDLE || state.state === STATES.PERMISSIONS_NEEDED) {
-      const { onboardingComplete, micEnabled } = await chrome.storage.local.get(['onboardingComplete', 'micEnabled']);
-      if (onboardingComplete) {
-        console.log(LOG_PREFIX, 'Skipping onboarding based on saved preference');
-        sendMessage(MSG.UI_TOGGLE_MIC, { micEnabled: !!micEnabled });
-        sendMessage(MSG.UI_ONBOARDING_COMPLETE);
-        // The service worker will handle this and broadcast STATE_CHANGED
-        // which will automatically switch us to the READY view.
+    // Fast-forward past onboarding if permission is already granted — but not
+    // on a first run. Granting the microphone in a previous install is not the
+    // same as having been told what this extension does.
+    const tourPending = !(await isOnboardingComplete());
+
+    if (!tourPending && (state.state === STATES.IDLE || state.state === STATES.PERMISSIONS_NEEDED)) {
+      try {
+        const status = await navigator.permissions.query({ name: 'microphone' });
+        if (status.state === 'granted') {
+          console.log(LOG_PREFIX, 'Mic permission already granted, skipping onboarding');
+          sendMessage(MSG.UI_TOGGLE_MIC, { micEnabled: true });
+          sendMessage(MSG.UI_ONBOARDING_COMPLETE);
+          // The service worker will handle this and broadcast STATE_CHANGED
+          // which will automatically switch us to the READY view.
+        }
+      } catch (e) {
+        // Ignore if permissions API fails
       }
     }
 
@@ -176,7 +249,11 @@ async function initialize() {
   } catch (err) {
     console.error(LOG_PREFIX, 'Failed to read initial state:', err);
     showView('view-error');
-    dom.errorMessage.textContent = 'Failed to load extension state. Please reload.';
+    showError(null, {
+      title: 'The extension could not start',
+      cause: 'Its saved state could not be read.',
+      action: 'Reload the extension at chrome://extensions, then reopen this panel.',
+    });
   }
 
   // React to future state changes pushed from the service worker
@@ -201,7 +278,6 @@ function cacheDomReferences() {
   // Ready
   dom.toggleMic       = document.getElementById('toggle-mic');
   dom.micStatusLabel   = document.getElementById('mic-status-label');
-  dom.btnRecord        = document.getElementById('btn-record');
   dom.sessionList      = document.getElementById('session-list');
   dom.noSessionsMsg    = document.getElementById('no-sessions-msg');
 
@@ -212,24 +288,50 @@ function cacheDomReferences() {
   dom.platformLabel    = document.getElementById('platform-label');
   dom.platformName     = document.getElementById('platform-name');
   dom.btnStop          = document.getElementById('btn-stop');
+  dom.btnStopVideoOnly = document.getElementById('btn-stop-video-only');
+  dom.liveTranscript   = document.getElementById('live-transcript');
+  dom.liveTranscriptText = document.getElementById('live-transcript-text');
+  dom.toggleLiveTranscript = document.getElementById('toggle-live-transcript');
 
   // Processing
   dom.progressBar      = document.getElementById('progress-bar');
   dom.progressLabel    = document.getElementById('progress-label');
 
   // Complete
-  dom.completeTitle    = document.getElementById('complete-title');
   dom.completeDuration = document.getElementById('complete-duration');
   dom.completePlatform = document.getElementById('complete-platform');
   dom.completeDate     = document.getElementById('complete-date');
+  dom.completeTitle    = document.getElementById('complete-title');
   dom.transcriptContainer = document.getElementById('transcript-container');
   dom.noTranscriptMsg  = document.getElementById('no-transcript-msg');
+  dom.transcribePrompt = document.getElementById('transcribe-prompt');
+  dom.btnTranscribeNow = document.getElementById('btn-transcribe-now');
+  dom.transcribePromptText = document.querySelector('#transcribe-prompt .transcribe-prompt-text');
+  dom.transcribePromptHint = document.querySelector('#transcribe-prompt .transcribe-prompt-hint');
+  dom.transcriptProgress = document.getElementById('transcript-progress');
+  dom.transcriptError    = document.getElementById('transcript-error');
+  dom.transcriptErrorText = document.getElementById('transcript-error-text');
+  dom.btnRetryTranscription = document.getElementById('btn-retry-transcription');
+  dom.transcriptErrorTitle  = document.getElementById('transcript-error-title');
+  dom.transcriptErrorAction = document.getElementById('transcript-error-action');
+  dom.transcriptErrorDetails = document.getElementById('transcript-error-details');
+  dom.transcriptErrorRaw    = document.getElementById('transcript-error-raw');
+
+  // Diagnostics
+  dom.btnRunDiagnostics  = document.getElementById('btn-run-diagnostics');
+  dom.btnCopyDiagnostics = document.getElementById('btn-copy-diagnostics');
+  dom.diagnosticsResults = document.getElementById('diagnostics-results');
+  dom.searchContainer  = document.getElementById('transcript-search-container');
   dom.mediaPlayer      = document.getElementById('media-player');
   dom.btnNewRecording  = document.getElementById('btn-new-recording');
   dom.btnBackComplete  = document.getElementById('btn-back-complete');
 
   // Error
+  dom.errorTitle       = document.getElementById('error-title');
   dom.errorMessage     = document.getElementById('error-message');
+  dom.errorAction      = document.getElementById('error-action');
+  dom.errorRawDetails  = document.getElementById('error-raw-details');
+  dom.errorRaw         = document.getElementById('error-raw');
   dom.btnDismissError  = document.getElementById('btn-dismiss-error');
 
   // Settings
@@ -251,15 +353,73 @@ function cacheDomReferences() {
   dom.btnGenerateAi    = document.getElementById('btn-generate-ai');
   dom.btnRetryAi       = document.getElementById('btn-retry-ai');
 
+  dom.aiHelpText       = document.getElementById('ai-help-text');
+  dom.aiProgressText   = document.getElementById('ai-progress-text');
+  dom.btnCancelAi      = document.getElementById('btn-cancel-ai');
+
   // Bookmarks
   dom.bookmarksContainer = document.getElementById('bookmarks-container');
   dom.btnAddBookmark   = document.getElementById('btn-add-bookmark');
+
+  // BYOK provider settings
+  dom.llmProvider      = document.getElementById('llm-provider');
+  dom.llmFormat        = document.getElementById('llm-format');
+  dom.llmFormatField   = document.getElementById('field-llm-format');
+  dom.llmBaseUrl       = document.getElementById('llm-base-url');
+  dom.llmApiKey        = document.getElementById('llm-api-key');
+  dom.llmModel         = document.getElementById('llm-model');
+  dom.llmModelOptions  = document.getElementById('llm-model-options');
+  dom.llmByokFields    = document.getElementById('llm-byok-fields');
+  dom.llmNote          = document.getElementById('llm-note');
+  dom.llmKeysLink      = document.getElementById('link-provider-keys');
+  dom.btnToggleKey     = document.getElementById('btn-toggle-key');
+  dom.btnLoadModels    = document.getElementById('btn-load-models');
+  dom.btnTestLlm       = document.getElementById('btn-test-llm');
+  dom.llmTestResult    = document.getElementById('llm-test-result');
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
 // VIEW MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Run the guided tour on first use, or fall back to the plain permission ask.
+ *
+ * The tour explains what is recorded, what leaves the machine, and that the
+ * first transcription downloads a large model — all things that previously
+ * surfaced only as a surprise later on.
+ *
+ * @returns {Promise<void>}
+ */
+async function showOnboarding() {
+  const tour = document.getElementById('onboarding-tour');
+  const basic = document.getElementById('onboarding-basic');
+  if (!tour || !basic) return;
+
+  try {
+    if (await isOnboardingComplete()) {
+      tour.hidden = true;
+      basic.hidden = false;
+      return;
+    }
+
+    tour.hidden = false;
+    basic.hidden = true;
+    await renderOnboarding(tour, {
+      onComplete: () => {
+        tour.hidden = true;
+        basic.hidden = false;
+      },
+    });
+  } catch (err) {
+    // A tour that cannot render must never block setup.
+    console.warn(LOG_PREFIX, 'Onboarding tour failed, showing the basic screen:', err);
+    tour.hidden = true;
+    basic.hidden = false;
+  }
+}
+
 
 /**
  * Show exactly one view section, hiding all others. Adds/removes the
@@ -311,7 +471,7 @@ function handleStateTransition(stateObj) {
   switch (stateObj.state) {
     case STATES.IDLE:
     case STATES.PERMISSIONS_NEEDED:
-      // Nothing extra needed — onboarding is static
+      showOnboarding();
       break;
 
     case STATES.READY:
@@ -326,22 +486,30 @@ function handleStateTransition(stateObj) {
       startRecordingTimer();
       syncMicToggle(stateObj.micEnabled);
       showPlatformBadge(stateObj.platform);
+      resetLiveTranscript();
+      // Re-arm both stop buttons for this recording.
+      dom.btnStop.disabled = false;
+      if (dom.btnStopVideoOnly) dom.btnStopVideoOnly.disabled = false;
       break;
 
     case STATES.PROCESSING:
-      stopRecordingTimer();
-      resetProgressBar();
-      break;
-
-    case STATES.COMPLETE:
+      // Reachable only from an older stored state. Treat it as COMPLETE.
       stopRecordingTimer();
       activeSessionId = stateObj.sessionId;
       loadCompleteView(stateObj.sessionId);
       break;
 
+    case STATES.COMPLETE:
+      stopRecordingTimer();
+      activeSessionId = stateObj.sessionId;
+      transcribingSessionId = stateObj.transcribingSessionId || null;
+      transcriptionError = stateObj.transcriptionError || null;
+      loadCompleteView(stateObj.sessionId);
+      break;
+
     case STATES.ERROR:
       stopRecordingTimer();
-      dom.errorMessage.textContent = stateObj.error || 'An unexpected error occurred.';
+      showError(stateObj.error);
       break;
   }
 }
@@ -398,27 +566,43 @@ function setupEventListeners() {
     }
   });
 
+  setupLlmSettings();
+
+  // Live transcript preference. The offscreen document reads this when a
+  // recording starts, so a change takes effect on the next recording.
+  chrome.storage.local.get('liveTranscript').then(({ liveTranscript }) => {
+    if (dom.toggleLiveTranscript) dom.toggleLiveTranscript.checked = Boolean(liveTranscript);
+  });
+
+  dom.toggleLiveTranscript?.addEventListener('change', (event) => {
+    chrome.storage.local.set({ liveTranscript: event.target.checked });
+  });
+
+  chrome.storage.local.get('transcriptCleanup').then(({ transcriptCleanup }) => {
+    const box = document.getElementById('toggle-transcript-cleanup');
+    if (box) box.checked = Boolean(transcriptCleanup);
+  });
+
+  document.getElementById('toggle-transcript-cleanup')?.addEventListener('change', (event) => {
+    chrome.storage.local.set({ transcriptCleanup: event.target.checked });
+  });
+
+  document.getElementById('btn-replay-onboarding')?.addEventListener('click', async () => {
+    await resetOnboarding();
+    showView('view-onboarding');
+    showOnboarding();
+  });
+
   // ── Ready ──────────────────────────────────────────────────────────
-  // dom.btnRecord.addEventListener('click', handleStartRecording);
   dom.toggleMic.addEventListener('change', handleMicToggle);
 
   // ── Recording ──────────────────────────────────────────────────────
-  dom.btnStop.addEventListener('click', handleStopRecording);
+  dom.btnStop.addEventListener('click', () => handleStopRecording(true));
+  dom.btnStopVideoOnly?.addEventListener('click', () => handleStopRecording(false));
 
   // ── Complete ───────────────────────────────────────────────────────
   dom.btnNewRecording.addEventListener('click', handleNewRecording);
-  dom.btnBackComplete.addEventListener('click', async () => {
-    const state = await getState();
-    if (state.state === STATES.COMPLETE) {
-      // We just finished a meeting, tell the service worker to return to READY
-      sendMessage(MSG.UI_RETURN_TO_READY);
-    } else {
-      // We were just viewing a past recording in READY state
-      // Simply return to the past recordings list without changing the state
-      showView('view-ready');
-      loadSessionList();
-    }
-  });
+  dom.btnBackComplete.addEventListener('click', () => showView('view-ready'));
 
   // Sync transcript highlighting with video playback
   dom.mediaPlayer.addEventListener('timeupdate', () => {
@@ -443,9 +627,6 @@ function setupEventListeners() {
     if (btn) handleExport(btn.dataset.format);
   });
 
-  // Regenerate Platform & Title when clicking Platform chip
-  dom.completePlatform.addEventListener('click', handleRegenerateMetadata);
-
   // ── Search ─────────────────────────────────────────────────────────
   const searchInput = document.getElementById('transcript-search');
   if (searchInput) {
@@ -461,6 +642,24 @@ function setupEventListeners() {
   // ── AI Notes ───────────────────────────────────────────────────────
   dom.btnGenerateAi?.addEventListener('click', handleGenerateAiNotes);
   dom.btnRetryAi?.addEventListener('click', handleGenerateAiNotes);
+  dom.btnCancelAi?.addEventListener('click', () => aiRunController?.abort());
+
+  // ── Regenerate title and platform from the transcript ──────────────
+  dom.completePlatform?.addEventListener('click', handleRegenerateMetadata);
+  dom.completePlatform?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      handleRegenerateMetadata();
+    }
+  });
+
+  // ── Transcribe a saved recording ───────────────────────────────────
+  dom.btnTranscribeNow?.addEventListener('click', handleTranscribeNow);
+  dom.btnRetryTranscription?.addEventListener('click', handleTranscribeNow);
+
+  // ── Diagnostics ────────────────────────────────────────────────────
+  dom.btnRunDiagnostics?.addEventListener('click', handleRunDiagnostics);
+  dom.btnCopyDiagnostics?.addEventListener('click', handleCopyDiagnostics);
 
   // ── Bookmarks ──────────────────────────────────────────────────────
   dom.btnAddBookmark?.addEventListener('click', handleAddBookmark);
@@ -488,20 +687,29 @@ function setupMessageListener() {
         break;
 
       case MSG.TRANSCRIPTION_PROGRESS:
-        if (message.payload.isRealTime) {
-          const liveText = document.getElementById('live-transcript-text');
-          if (liveText) {
-            if (liveText.textContent === 'Listening...') {
-              liveText.textContent = '';
-            }
-            const span = document.createElement('span');
-            span.textContent = message.payload.text + " ";
-            liveText.appendChild(span);
-            liveText.parentElement.scrollTop = liveText.parentElement.scrollHeight;
-          }
+        // Live preview slices arrive on the same channel as the post-recording
+        // progress bar, distinguished by isRealTime.
+        if (message.payload?.isRealTime) {
+          appendLiveTranscript(message.payload.text);
         } else {
           updateProgressBar(message.payload);
         }
+        break;
+
+      case MSG.TRANSCRIPTION_COMPLETE:
+        // Background work finished. Refresh in place only if the user is still
+        // looking at that recording; otherwise the session list picks it up.
+        transcribingSessionId = null;
+        transcriptionError = null;
+        if (message.payload?.sessionId === activeSessionId) {
+          loadCompleteView(activeSessionId);
+        }
+        break;
+
+      case MSG.TRANSCRIPTION_ERROR:
+        transcribingSessionId = null;
+        transcriptionError = message.payload?.error || 'Transcription failed.';
+        if (activeSessionId) renderTranscriptTabState();
         break;
 
       default:
@@ -525,52 +733,62 @@ function setupMessageListener() {
  */
 async function handleGrantPermission() {
   console.log(LOG_PREFIX, 'Requesting microphone permission');
-
   try {
-    // Check if we are in a side panel or a full tab
-    const currentTab = await new Promise(resolve => chrome.tabs.getCurrent(resolve));
-    
-    if (!currentTab) {
-      // We are in the side panel. Chrome blocks permission prompts here and hangs getUserMedia.
-      console.log(LOG_PREFIX, 'In side panel. Opening full tab for permission prompt.');
-      if (dom.errorMessage) {
-        dom.errorMessage.textContent = 'Chrome requires you to grant microphone permission from a full tab. A new tab has been opened for you.';
-      }
-      showView('view-error');
-      // Open the panel in a full tab to show the prompt.
-      chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel/panel.html') });
-      return; // Do not call getUserMedia!
-    }
-
-    // We are in a full tab, it is safe to call getUserMedia
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     // Stop all tracks immediately — we just needed the permission prompt
     stream.getTracks().forEach((track) => track.stop());
     console.log(LOG_PREFIX, 'Microphone permission granted');
     
-    // Success: Save permission in local storage
-    await chrome.storage.local.set({ onboardingComplete: true, micEnabled: true });
+    // Nudge service worker to transition to READY
     sendMessage(MSG.UI_TOGGLE_MIC, { micEnabled: true });
     sendMessage(MSG.UI_ONBOARDING_COMPLETE);
 
-    // Close the standalone tab automatically
-    chrome.tabs.remove(currentTab.id);
+    // If we are in a standalone tab (not the side panel), close ourselves
+    chrome.tabs.getCurrent((tab) => {
+      if (tab) chrome.tabs.remove(tab.id);
+    });
 
   } catch (err) {
     console.error(LOG_PREFIX, 'Microphone permission denied:', err);
     
-    // We are in a full tab, meaning the user actually clicked "Block"
-    if (dom.errorMessage) {
-      dom.errorMessage.textContent = 'Microphone access was denied. Please click the site settings icon in the URL bar to allow microphone access, then reload this page.';
-    }
-    showView('view-error');
+    chrome.tabs.getCurrent((tab) => {
+      if (!tab) {
+        // We are in the side panel. Chrome blocks permission prompts here.
+        // Show a message in the side panel so the user isn't confused
+        if (dom.errorMessage) {
+          showError(null, {
+            title: 'Microphone permission needs a full tab',
+            cause: 'Chrome does not allow a side panel to request microphone access.',
+            action: 'A new tab has been opened. Grant access there, then come back.',
+          });
+        }
+        showView('view-error');
+        // Open the panel in a full tab to show the prompt.
+        chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel/panel.html') });
+      } else {
+        // We are in a full tab, meaning the user actually clicked "Block"
+        if (dom.errorMessage) {
+          showError(null, {
+            title: 'Microphone access was denied',
+            cause: 'Chrome is blocking this extension from using the microphone.',
+            action: 'Click the tune icon in the address bar, allow the microphone, then reload.',
+          });
+        }
+        showView('view-error');
+      }
+    });
   }
 }
 
 
+/**
+ * Skip microphone permission — user wants tab-only recording.
+ * Tells the service worker to transition to READY with mic disabled.
+ *
+ * @returns {void}
+ */
 function handleSkipPermission() {
   console.log(LOG_PREFIX, 'User skipped mic permission');
-  chrome.storage.local.set({ onboardingComplete: true, micEnabled: false });
   sendMessage(MSG.UI_TOGGLE_MIC, { micEnabled: false });
   sendMessage(MSG.UI_ONBOARDING_COMPLETE);
 }
@@ -590,9 +808,39 @@ function handleSkipPermission() {
  *
  * @returns {void}
  */
-function handleStopRecording() {
-  console.log(LOG_PREFIX, 'Stop recording requested');
-  sendMessage(MSG.UI_STOP_RECORDING);
+function handleStopRecording(transcribe = true) {
+  console.log(LOG_PREFIX, `Stop recording requested (transcribe: ${transcribe})`);
+
+  // Both stop buttons write the same message; only the flag differs. Disable
+  // them straight away so a double click cannot send two stops.
+  dom.btnStop.disabled = true;
+  if (dom.btnStopVideoOnly) dom.btnStopVideoOnly.disabled = true;
+
+  sendMessage(MSG.UI_STOP_RECORDING, { transcribe });
+}
+
+
+/**
+ * Transcribe the recording currently on screen.
+ *
+ * Used for recordings saved without transcription, and to re-run transcription
+ * on an old session. The service worker moves the extension to PROCESSING and
+ * the offscreen document does the work.
+ *
+ * @returns {void}
+ */
+function handleTranscribeNow() {
+  if (!activeSessionId) return;
+
+  console.log(LOG_PREFIX, 'Transcription requested for session:', activeSessionId);
+  if (dom.btnTranscribeNow) dom.btnTranscribeNow.disabled = true;
+  if (dom.btnRetryTranscription) dom.btnRetryTranscription.disabled = true;
+
+  transcriptionError = null;
+  transcribingSessionId = activeSessionId;
+  renderTranscriptTabState();
+
+  sendMessage(MSG.UI_START_TRANSCRIPTION, { sessionId: activeSessionId });
 }
 
 
@@ -655,6 +903,13 @@ async function handleExport(format) {
     return;
   }
 
+  // The video is the recording itself, so it exports even when there is no
+  // transcript — which is now a normal state, not a failure.
+  if (format === 'webm') {
+    await exportRecording();
+    return;
+  }
+
   const formatter = EXPORT_FORMATTERS[format];
   if (!formatter) {
     console.error(LOG_PREFIX, 'Unknown export format:', format);
@@ -664,20 +919,10 @@ async function handleExport(format) {
   console.log(LOG_PREFIX, `Exporting as ${format} for session:`, activeSessionId);
 
   try {
-    const session = await getSession(activeSessionId);
-    if (!session) return;
-
-    if (format === 'webm') {
-      const blob = await readFile(`session_${activeSessionId}_primary.webm`);
-      if (!blob) {
-        console.warn(LOG_PREFIX, 'No video file found for export');
-        return;
-      }
-      triggerDownload(blob, `silentscribe-${formatDateForFilename(session?.startTime)}.webm`);
-      return;
-    }
-
-    const transcript = await getTranscript(activeSessionId);
+    const [transcript, session] = await Promise.all([
+      getTranscript(activeSessionId),
+      getSession(activeSessionId),
+    ]);
 
     if (!transcript || !transcript.segments || transcript.segments.length === 0) {
       console.warn(LOG_PREFIX, 'No transcript data to export');
@@ -691,6 +936,101 @@ async function handleExport(format) {
     triggerDownload(blob, `silentscribe-${formatDateForFilename(session?.startTime)}.${format}`);
   } catch (err) {
     console.error(LOG_PREFIX, 'Export failed:', err);
+  }
+}
+
+
+/**
+ * Download the raw recording for the session on screen.
+ *
+ * @returns {Promise<void>}
+ */
+async function exportRecording() {
+  try {
+    const [blob, session] = await Promise.all([
+      readFile(`session_${activeSessionId}_primary.webm`),
+      getSession(activeSessionId),
+    ]);
+
+    if (!blob || blob.size === 0) {
+      showError(null, {
+        title: 'There is no video to export',
+        cause: 'No recording file was found for this session.',
+        action: 'The capture may have failed. Record again.',
+      });
+      return;
+    }
+
+    triggerDownload(blob, `silentscribe-${formatDateForFilename(session?.startTime)}.webm`);
+  } catch (err) {
+    console.error(LOG_PREFIX, 'Video export failed:', err);
+  }
+}
+
+
+/**
+ * Ask the model to re-read the transcript and name the recording.
+ *
+ * URL-based platform detection only knows the four meeting sites in the
+ * manifest, so anything else records as "unknown". This reads the transcript
+ * instead and sets both a title and a category. Both calls fail soft: a
+ * provider that is unreachable leaves the existing values alone.
+ *
+ * @returns {Promise<void>}
+ */
+async function handleRegenerateMetadata() {
+  if (!activeSessionId || regeneratingMetadata) return;
+
+  const platformChip = dom.completePlatform?.querySelector('.chip-text');
+  if (!platformChip) return;
+
+  const previousPlatform = platformChip.textContent;
+  regeneratingMetadata = true;
+  platformChip.textContent = 'Thinking…';
+
+  try {
+    const transcript = await getTranscript(activeSessionId);
+    if (!transcript?.segments?.length) {
+      platformChip.textContent = previousPlatform;
+      showError(null, {
+        title: 'Nothing to read yet',
+        cause: 'This recording has no transcript, so there is nothing to name it from.',
+        action: 'Transcribe the recording first, then try again.',
+      });
+      return;
+    }
+
+    const [platform, title] = await Promise.all([
+      generateAiPlatform(transcript.segments),
+      generateAiTitle(transcript.segments),
+    ]);
+
+    if (platform) {
+      await updateSessionPlatform(activeSessionId, platform);
+      platformChip.textContent = capitalizePlatform(platform);
+    } else {
+      platformChip.textContent = previousPlatform;
+    }
+
+    if (title) {
+      await updateSessionMeetingTitle(activeSessionId, title);
+      if (dom.completeTitle) dom.completeTitle.textContent = title;
+    }
+
+    if (!platform && !title) {
+      showError(null, {
+        title: 'The model did not return anything usable',
+        cause: 'The request completed but produced no title or category.',
+        action: 'Check Settings, then run Test connection.',
+      });
+    }
+
+    loadSessionList();
+  } catch (err) {
+    console.error(LOG_PREFIX, 'Metadata regeneration failed:', err);
+    platformChip.textContent = previousPlatform;
+  } finally {
+    regeneratingMetadata = false;
   }
 }
 
@@ -786,15 +1126,16 @@ function updateLevelMeters(levels) {
  * @returns {void}
  */
 function updateProgressBar(payload) {
+  if (!dom.progressBar) return;
+
   const pct = Math.min(100, Math.max(0, (payload.progress || 0) * 100));
   dom.progressBar.style.width = `${pct}%`;
   dom.progressBar.setAttribute('aria-valuenow', Math.round(pct));
-  dom.progressLabel.textContent = `${Math.round(pct)}%`;
-  
-  if (payload.status) {
-    const titleEl = document.querySelector('.processing-title');
-    if (titleEl) titleEl.textContent = payload.status;
-  }
+
+  // The worker's status is the informative part: it distinguishes a 145 MB
+  // first-run model download from actual transcription.
+  const status = payload.status ? `${payload.status} ` : '';
+  dom.progressLabel.textContent = `${status}${Math.round(pct)}%`;
 }
 
 
@@ -804,9 +1145,10 @@ function updateProgressBar(payload) {
  * @returns {void}
  */
 function resetProgressBar() {
+  if (!dom.progressBar) return;
   dom.progressBar.style.width = '0%';
   dom.progressBar.setAttribute('aria-valuenow', '0');
-  dom.progressLabel.textContent = '0%';
+  dom.progressLabel.textContent = 'Starting…';
 }
 
 
@@ -1004,6 +1346,46 @@ function handleSegmentEdit(sessionId, segmentIndex, textElement) {
  * 
  * @param {string} query - The search text.
  */
+/**
+ * Split text into nodes with each match of `query` wrapped for highlighting.
+ *
+ * Returns DOM nodes rather than an HTML string so no part of the transcript is
+ * ever parsed as markup, and no pattern is compiled from user input.
+ *
+ * @param {string} text - The original segment text.
+ * @param {string} textLower - The same text, lowercased, for matching.
+ * @param {string} query - The lowercased search query.
+ * @returns {Node[]}
+ */
+function highlightMatches(text, textLower, query) {
+  const nodes = [];
+  let from = 0;
+
+  for (;;) {
+    const at = textLower.indexOf(query, from);
+    if (at === -1) break;
+
+    if (at > from) nodes.push(document.createTextNode(text.slice(from, at)));
+
+    const mark = document.createElement('span');
+    mark.className = 'search-highlight';
+    mark.textContent = text.slice(at, at + query.length);
+    nodes.push(mark);
+
+    from = at + query.length;
+  }
+
+  if (from < text.length) nodes.push(document.createTextNode(text.slice(from)));
+  return nodes;
+}
+
+
+/**
+ * Filter and highlight transcript segments against a search query.
+ *
+ * @param {string} query - Raw text from the search box.
+ * @returns {void}
+ */
 function handleTranscriptSearch(query) {
   const q = query.trim().toLowerCase();
   const segments = dom.transcriptContainer.querySelectorAll('.transcript-segment');
@@ -1017,7 +1399,8 @@ function handleTranscriptSearch(query) {
     const textEl = segment.querySelector('.segment-text');
     const speakerEl = segment.querySelector('.segment-speaker');
     const timeEl = segment.querySelector('.segment-timestamp');
-    
+    if (!textEl) return;
+
     // Clear previous highlights
     if (textEl.dataset.originalText) {
       textEl.textContent = textEl.dataset.originalText;
@@ -1031,8 +1414,8 @@ function handleTranscriptSearch(query) {
     }
 
     const text = textEl.dataset.originalText || textEl.textContent;
-    const speaker = speakerEl.textContent.toLowerCase();
-    const time = timeEl.textContent.toLowerCase();
+    const speaker = (speakerEl?.textContent || '').toLowerCase();
+    const time = (timeEl?.textContent || '').toLowerCase();
     const textLower = text.toLowerCase();
 
     if (textLower.includes(q) || speaker.includes(q) || time.includes(q)) {
@@ -1044,10 +1427,14 @@ function handleTranscriptSearch(query) {
         textEl.dataset.originalText = text;
       }
 
-      // Highlight matching text (case-insensitive) if the match is in the text
+      // Highlight with DOM nodes, not a regex and not innerHTML.
+      //
+      // The old version compiled the raw query as a pattern, so searching for
+      // "(" threw a SyntaxError and broke the box. It also wrote transcript
+      // text straight into innerHTML, so anything the speech model produced
+      // that looked like markup became live markup in the panel.
       if (textLower.includes(q)) {
-        const regex = new RegExp(`(${q})`, 'gi');
-        textEl.innerHTML = text.replace(regex, '<span class="search-highlight">$1</span>');
+        textEl.replaceChildren(...highlightMatches(text, textLower, q));
       }
     } else {
       segment.classList.add('hidden-by-search');
@@ -1194,13 +1581,16 @@ function renderSessionList(sessions) {
     title.className = 'session-card-title';
     title.textContent = formatSessionTitle(session);
 
+    // Built from nodes, not an HTML string. `platform` is no longer only a
+    // fixed enum from URL detection — generateAiPlatform() can set it from
+    // model output, which must never be parsed as markup.
     const meta = document.createElement('div');
     meta.className = 'session-card-meta';
-    meta.innerHTML = `
-      <span>${session.duration ? formatDuration(session.duration) : '—'}</span>
-      <span>·</span>
-      <span>${capitalizePlatform(session.platform)}</span>
-    `;
+    meta.append(
+      spanWithText(session.duration ? formatDuration(session.duration) : '—'),
+      spanWithText('·'),
+      spanWithText(capitalizePlatform(session.platform)),
+    );
 
     body.appendChild(title);
     body.appendChild(meta);
@@ -1208,7 +1598,9 @@ function renderSessionList(sessions) {
     // Transcription badge
     const badge = document.createElement('span');
     badge.className = `session-badge ${session.transcribed ? 'session-badge-transcribed' : 'session-badge-pending'}`;
-    badge.textContent = session.transcribed ? 'Done' : 'Pending';
+    // "Pending" would be wrong now that skipping transcription is a choice —
+    // an untranscribed recording is finished, just without a transcript.
+    badge.textContent = session.transcribed ? 'Transcript' : 'Video only';
 
     // Delete button
     const deleteBtn = document.createElement('button');
@@ -1331,46 +1723,37 @@ async function loadCompleteView(sessionId) {
  * @returns {Promise<void>}
  */
 async function populateCompleteView(session) {
-  // Set title
-  if (dom.completeTitle) {
-    dom.completeTitle.textContent = session.metadata?.title || 'Recording Details';
-  }
-
   // Session info chips
   const durationChip = dom.completeDuration.querySelector('.chip-text');
   durationChip.textContent = session.duration ? formatDuration(session.duration) : '—';
 
   const platformChip = dom.completePlatform.querySelector('.chip-text');
   platformChip.textContent = capitalizePlatform(session.platform);
-  // Store session ID on the chip so the click handler knows which session to update
-  dom.completePlatform.dataset.sessionId = session.id;
 
   const dateChip = dom.completeDate.querySelector('.chip-text');
   dateChip.textContent = formatDate(session.startTime);
 
+  if (dom.completeTitle) dom.completeTitle.textContent = formatSessionTitle(session);
+
   // Transcript
+  let segments = [];
   try {
     const transcript = await getTranscript(session.id);
-    if (transcript && transcript.segments) {
-      renderTranscript(transcript.segments, session.speakerNames || {});
-    } else {
-      renderTranscript([], {});
-    }
+    segments = transcript?.segments || [];
   } catch (err) {
     console.error(LOG_PREFIX, 'Failed to load transcript:', err);
-    renderTranscript([], {});
   }
+  renderTranscript(segments, session.speakerNames || {});
+  // Transcribed with nothing found is a different state from never transcribed.
+  // Offering "Transcribe now" for the first would just repeat an empty result.
+  showTranscribePrompt(segments.length === 0, Boolean(session.transcribed));
+  renderTranscriptTabState();
 
-  // Audio player
-  const audioBlob = await readFile(`session_${session.id}_primary.webm`);
-  if (audioBlob) {
-    const audioUrl = URL.createObjectURL(audioBlob);
-    dom.mediaPlayer.src = audioUrl;
-    dom.mediaPlayer.dataset.sessionId = session.id;
-  } else {
-    dom.mediaPlayer.removeAttribute('src');
-    dom.mediaPlayer.dataset.sessionId = '';
-  }
+  // Audio player. setupAudioPlayer() keeps the object URL in module state so
+  // revokeAudioUrl() can free it — creating one inline here leaked the whole
+  // video blob every time a session was opened.
+  await setupAudioPlayer(session.id);
+  dom.mediaPlayer.dataset.sessionId = dom.mediaPlayer.getAttribute('src') ? session.id : '';
 
   // Bookmarks
   renderBookmarks(session.bookmarks || []);
@@ -1383,6 +1766,87 @@ async function populateCompleteView(session) {
 // ═══════════════════════════════════════════════════════════════════════════
 // AUDIO PLAYER
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Swap the transcript tab between the transcript itself and the offer to
+ * generate one.
+ *
+ * @param {boolean} show - True when the recording has no transcript.
+ * @returns {void}
+ */
+/**
+ * Show whichever of the transcript tab's four states applies right now:
+ * running, failed, empty result, or never transcribed.
+ *
+ * Called after a view load and whenever a background job changes state, so it
+ * must be safe to run at any time.
+ *
+ * @returns {void}
+ */
+function renderTranscriptTabState() {
+  const running = Boolean(activeSessionId) && transcribingSessionId === activeSessionId;
+  const failed = Boolean(transcriptionError) && !running;
+
+  if (dom.transcriptProgress) dom.transcriptProgress.hidden = !running;
+  if (dom.transcriptError) dom.transcriptError.hidden = !failed;
+  if (failed) {
+    const explained = explainError(transcriptionError);
+    if (dom.transcriptErrorTitle) dom.transcriptErrorTitle.textContent = explained.title;
+    if (dom.transcriptErrorText) dom.transcriptErrorText.textContent = explained.cause;
+    if (dom.transcriptErrorAction) dom.transcriptErrorAction.textContent = explained.action;
+    // The raw message stays available but folded away, so the panel reads
+    // clearly while still carrying everything needed for a bug report.
+    if (dom.transcriptErrorDetails) {
+      dom.transcriptErrorDetails.hidden = !explained.known || !explained.raw;
+    }
+    if (dom.transcriptErrorRaw) dom.transcriptErrorRaw.textContent = explained.raw;
+  }
+  // Re-arm the retry button whenever the failure panel comes back into view.
+  if (dom.btnRetryTranscription) dom.btnRetryTranscription.disabled = running;
+
+  // The offer to transcribe makes no sense while a job is running or has just
+  // failed with its own retry button.
+  if ((running || failed) && dom.transcribePrompt) {
+    dom.transcribePrompt.hidden = true;
+    if (dom.searchContainer) dom.searchContainer.hidden = true;
+    if (dom.transcriptContainer) dom.transcriptContainer.hidden = true;
+  }
+
+  if (running) resetProgressBar();
+}
+
+
+function showTranscribePrompt(show, alreadyTranscribed = false) {
+  if (!dom.transcribePrompt) return;
+
+  dom.transcribePrompt.hidden = !show;
+  if (dom.btnTranscribeNow) dom.btnTranscribeNow.disabled = false;
+
+  // Searching and the "no segments" placeholder mean nothing without a
+  // transcript, so hide them while the offer is up.
+  if (dom.searchContainer) dom.searchContainer.hidden = show;
+  if (dom.transcriptContainer) dom.transcriptContainer.hidden = show;
+
+  if (!show) return;
+
+  const emptyResult = alreadyTranscribed;
+  if (dom.transcribePromptText) {
+    dom.transcribePromptText.textContent = emptyResult
+      ? 'No speech was detected in this recording.'
+      : 'This recording has no transcript yet.';
+  }
+  if (dom.transcribePromptHint) {
+    dom.transcribePromptHint.textContent = emptyResult
+      ? 'The audio was processed but contained no recognisable speech. Check that the meeting tab was producing sound, then try again.'
+      : 'Runs Whisper on your computer. Long recordings take a few minutes.';
+  }
+  if (dom.btnTranscribeNow) {
+    dom.btnTranscribeNow.replaceChildren(document.createTextNode(
+      emptyResult ? 'Try transcribing again' : 'Transcribe now',
+    ));
+  }
+}
+
 
 /**
  * Set up the HTML5 audio player with the full recording blob.
@@ -1546,48 +2010,122 @@ function getFilenameDateString(timestamp) {
 // AI NOTES & BOOKMARKS (V2 Features)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * Generate meeting notes for the session on screen.
+ *
+ * Routes to whichever engine Settings selects — Chrome's on-device model or a
+ * provider key. Long transcripts are summarized part by part, so the progress
+ * line reports which part is running and Cancel can stop the run.
+ *
+ * @returns {Promise<void>}
+ */
 async function handleGenerateAiNotes() {
   if (!activeSessionId) return;
-  if (!dom.aiLoading.hidden) return; // Prevent overlapping clicks
 
   const session = await getSession(activeSessionId);
   if (!session) return;
+
+  aiRunController?.abort();
+  aiRunController = new AbortController();
+  const sessionIdAtStart = activeSessionId;
 
   dom.aiUninitialized.hidden = true;
   dom.aiLoading.hidden = false;
   dom.aiError.hidden = true;
   dom.aiNotesContainer.hidden = true;
-
-  const progressTextEl = document.getElementById('ai-progress-text');
+  setAiProgress('Reading the transcript...');
 
   try {
     const transcript = await getTranscript(activeSessionId);
-    if (!transcript || !transcript.segments || transcript.segments.length === 0) {
-      throw new Error("No transcript available to generate notes.");
+    if (!transcript?.segments?.length) {
+      throw new Error('There is no transcript to summarize yet.');
     }
 
-    // Format transcript into a simple readable text for the prompt
-    const formattedTranscript = transcript.segments.map(s => `[${s.start.toFixed(1)}s] ${s.text}`).join('\n');
-
-    const notes = await generateAiNotes(formattedTranscript, (progressText) => {
-      if (progressTextEl) {
-        progressTextEl.textContent = progressText;
-      }
+    const notes = await generateAiNotes(transcript.segments, session, {
+      signal: aiRunController.signal,
+      onProgress: (status) => setAiProgress(status),
     });
 
-    await saveAiInsights(activeSessionId, notes);
-    
-    // Refresh the view
-    const updatedSession = await getSession(activeSessionId);
-    renderAiNotesState(updatedSession);
+    // The user may have navigated to another session while this ran.
+    if (activeSessionId !== sessionIdAtStart) return;
+
+    await saveAiInsights(sessionIdAtStart, notes);
+    renderAiNotesState(await getSession(sessionIdAtStart));
   } catch (err) {
+    if (err.name === 'AbortError') {
+      console.log(LOG_PREFIX, 'AI note generation cancelled by the user.');
+      renderAiNotesState(session);
+      return;
+    }
+
     console.error(LOG_PREFIX, 'Failed to generate AI notes:', err);
     dom.aiLoading.hidden = true;
     dom.aiError.hidden = false;
     const errorEl = dom.aiError.querySelector('p') || dom.aiError;
-    errorEl.textContent = err.message || 'AI Generation failed.';
+    errorEl.textContent = err.message || 'AI generation failed.';
+  } finally {
+    aiRunController = null;
   }
 }
+
+
+/**
+ * Clear the live transcript back to its waiting state.
+ *
+ * @returns {void}
+ */
+function resetLiveTranscript() {
+  if (!dom.liveTranscriptText) return;
+  dom.liveTranscriptText.textContent = 'Listening…';
+  dom.liveTranscriptText.dataset.empty = 'true';
+  if (dom.liveTranscript) {
+    // Stays hidden until the setting produces a first slice, so an unused
+    // feature never takes up space in the recording view.
+    dom.liveTranscript.hidden = !dom.toggleLiveTranscript?.checked;
+  }
+}
+
+
+/**
+ * Append a slice of live transcript during recording.
+ *
+ * Text nodes only: this is speech-model output and must never be parsed as
+ * markup. Older slices are dropped so a long meeting cannot grow the panel
+ * without bound.
+ *
+ * @param {string} text - The recognised text for one slice.
+ * @returns {void}
+ */
+function appendLiveTranscript(text) {
+  if (!dom.liveTranscriptText || !text) return;
+
+  if (dom.liveTranscript) dom.liveTranscript.hidden = false;
+  if (dom.liveTranscriptText.dataset.empty !== 'false') {
+    dom.liveTranscriptText.textContent = '';
+    dom.liveTranscriptText.dataset.empty = 'false';
+  }
+
+  dom.liveTranscriptText.append(document.createTextNode(`${text} `));
+
+  while (dom.liveTranscriptText.childNodes.length > LIVE_TRANSCRIPT_MAX_SLICES) {
+    dom.liveTranscriptText.firstChild.remove();
+  }
+
+  dom.liveTranscriptText.parentElement.scrollTop =
+    dom.liveTranscriptText.parentElement.scrollHeight;
+}
+
+
+/**
+ * Update the line shown under the spinner while notes are generating.
+ *
+ * @param {string} status - Human-readable progress text.
+ * @returns {void}
+ */
+function setAiProgress(status) {
+  if (dom.aiProgressText) dom.aiProgressText.textContent = status;
+}
+
 
 async function handleAddBookmark() {
   if (!activeSessionId || !dom.mediaPlayer) return;
@@ -1603,26 +2141,58 @@ async function handleAddBookmark() {
   }
 }
 
+
+/**
+ * Show either the stored notes or the "generate" prompt for a session.
+ *
+ * @param {Object} session - Session record.
+ * @returns {void}
+ */
 function renderAiNotesState(session) {
   if (!session) return;
-  
-  if (session.aiSummary) {
+
+  if (session.aiInsights) {
     dom.aiUninitialized.hidden = true;
     dom.aiLoading.hidden = true;
     dom.aiError.hidden = true;
     dom.aiNotesContainer.hidden = false;
-    dom.aiNotesContainer.innerHTML = '';
-    const p = document.createElement('div');
-    p.style.whiteSpace = 'pre-wrap';
-    p.textContent = session.aiSummary;
-    dom.aiNotesContainer.appendChild(p);
+    // renderMarkdown escapes the model's output before applying Markdown,
+    // so nothing it writes can become live markup.
+    dom.aiNotesContainer.innerHTML = renderMarkdown(session.aiInsights);
   } else {
     dom.aiUninitialized.hidden = false;
     dom.aiLoading.hidden = true;
     dom.aiError.hidden = true;
     dom.aiNotesContainer.hidden = true;
+    refreshAiHelpText();
   }
 }
+
+
+/**
+ * Describe the configured engine under the Generate button, and disable the
+ * button when no engine can run. Better than letting the user click into a
+ * failure.
+ *
+ * @returns {Promise<void>}
+ */
+async function refreshAiHelpText() {
+  if (!dom.aiHelpText) return;
+
+  try {
+    const { ready, engine, label, detail } = await checkAiAvailability();
+    dom.aiHelpText.textContent = ready
+      ? (engine === 'builtin'
+          ? `${label}. Nothing leaves your computer.`
+          : `Sends the transcript to ${label}.`)
+      : detail;
+    if (dom.btnGenerateAi) dom.btnGenerateAi.disabled = !ready;
+  } catch (err) {
+    console.warn(LOG_PREFIX, 'Could not check AI availability:', err);
+    dom.aiHelpText.textContent = 'Could not check the notes engine. Open Settings.';
+  }
+}
+
 
 function renderBookmarks(bookmarks) {
   if (!dom.bookmarksContainer) return;
@@ -1657,6 +2227,19 @@ function formatDateForFilename(timestamp) {
 
 
 /**
+ * A <span> carrying exactly the given text and nothing else.
+ *
+ * @param {string} text
+ * @returns {HTMLSpanElement}
+ */
+function spanWithText(text) {
+  const span = document.createElement('span');
+  span.textContent = text;
+  return span;
+}
+
+
+/**
  * Create a display title for a session. Uses the meeting title if
  * available, otherwise falls back to platform + date.
  *
@@ -1664,7 +2247,7 @@ function formatDateForFilename(timestamp) {
  * @returns {string} Display title.
  */
 function formatSessionTitle(session) {
-  if (session.metadata?.title) return session.metadata.title;
+  if (session.meetingTitle) return session.meetingTitle;
   const date = formatDate(session.startTime);
   const platform = capitalizePlatform(session.platform);
   return `${platform} — ${date}`;
@@ -1708,55 +2291,6 @@ function switchTab(tabName) {
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPERS — FILE DOWNLOAD
 // ═══════════════════════════════════════════════════════════════════════════
-// METADATA GENERATION
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Handle clicking the platform chip to regenerate both Platform and Title via AI.
- */
-async function handleRegenerateMetadata() {
-  const sessionId = dom.completePlatform.dataset.sessionId;
-  if (!sessionId) return;
-
-  const platformChip = dom.completePlatform.querySelector('.chip-text');
-  const originalPlatform = platformChip.textContent;
-  const originalTitle = dom.completeTitle.textContent;
-
-  platformChip.innerHTML = '<i class="ph ph-spinner ph-spin"></i> Thinking...';
-  dom.completePlatform.style.pointerEvents = 'none'; // Prevent double clicks
-
-  try {
-    const transcript = await getTranscript(sessionId);
-    if (!transcript || !transcript.segments) throw new Error('No transcript found');
-
-    const [newPlatform, newTitle] = await Promise.all([
-      generateAiPlatform(transcript.segments),
-      generateAiTitle(transcript.segments)
-    ]);
-
-    if (newPlatform) {
-      await updateSessionPlatform(sessionId, newPlatform);
-      platformChip.textContent = capitalizePlatform(newPlatform);
-    } else {
-      platformChip.textContent = originalPlatform;
-    }
-
-    if (newTitle) {
-      await updateSessionMetadata(sessionId, { title: newTitle });
-      dom.completeTitle.textContent = newTitle;
-    } else {
-      dom.completeTitle.textContent = originalTitle;
-    }
-
-  } catch (err) {
-    console.error(LOG_PREFIX, 'Failed to regenerate metadata:', err);
-    platformChip.textContent = originalPlatform;
-  } finally {
-    dom.completePlatform.style.pointerEvents = 'auto';
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 
 /**
  * Trigger a browser file download from a Blob. Creates a temporary
@@ -1780,6 +2314,319 @@ function triggerDownload(blob, filename) {
     URL.revokeObjectURL(url);
     anchor.remove();
   }, 100);
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ERROR PRESENTATION AND DIAGNOSTICS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Fill the error view with a cause and a next action rather than a raw string.
+ *
+ * @param {Error|string} error - The failure.
+ * @param {Object} [override] - Optional {title, cause, action} to show verbatim.
+ * @returns {void}
+ */
+function showError(error, override) {
+  const explained = override
+    ? { raw: '', known: true, ...override }
+    : explainError(error || 'An unexpected error occurred.');
+
+  if (dom.errorTitle) dom.errorTitle.textContent = explained.title;
+  if (dom.errorMessage) dom.errorMessage.textContent = explained.cause;
+  if (dom.errorAction) dom.errorAction.textContent = explained.action || '';
+
+  // Show the raw text only when it is not already the cause, so the panel
+  // never prints the same sentence twice.
+  const showRaw = Boolean(explained.raw) && explained.raw !== explained.cause;
+  if (dom.errorRawDetails) dom.errorRawDetails.hidden = !showRaw;
+  if (dom.errorRaw) dom.errorRaw.textContent = explained.raw || '';
+}
+
+
+/**
+ * Run every check and render the results.
+ *
+ * @returns {Promise<void>}
+ */
+async function handleRunDiagnostics() {
+  dom.btnRunDiagnostics.disabled = true;
+  dom.diagnosticsResults.hidden = false;
+  dom.diagnosticsResults.replaceChildren(buildDiagnosticRow({
+    name: 'Running', status: 'pending', detail: 'Checking every component...',
+  }));
+
+  try {
+    const { checks, summary } = await collectDiagnostics();
+
+    const rows = checks.map(buildDiagnosticRow);
+    const heading = document.createElement('p');
+    heading.className = 'diagnostics-summary';
+    heading.textContent = summary.fail
+      ? `${summary.fail} failing, ${summary.warn} warning, ${summary.ok} healthy`
+      : summary.warn
+        ? `${summary.warn} warning, ${summary.ok} healthy`
+        : `All ${summary.ok} checks healthy`;
+
+    dom.diagnosticsResults.replaceChildren(heading, ...rows);
+    dom.btnCopyDiagnostics.hidden = false;
+    lastDiagnostics = checks;
+  } catch (err) {
+    console.error(LOG_PREFIX, 'Diagnostics failed:', err);
+    dom.diagnosticsResults.replaceChildren(buildDiagnosticRow({
+      name: 'Diagnostics', status: 'fail', detail: err.message,
+    }));
+  } finally {
+    dom.btnRunDiagnostics.disabled = false;
+  }
+}
+
+
+/**
+ * Build one result row. Text is set with textContent throughout, because these
+ * details include provider messages and file paths.
+ *
+ * @param {{name: string, status: string, detail: string}} check
+ * @returns {HTMLElement}
+ */
+function buildDiagnosticRow(check) {
+  const row = document.createElement('div');
+  row.className = `diagnostic-row is-${check.status}`;
+
+  const icon = document.createElement('span');
+  icon.className = 'diagnostic-icon';
+  icon.textContent = { ok: '✓', warn: '!', fail: '✕', pending: '…' }[check.status] || '?';
+  icon.setAttribute('aria-hidden', 'true');
+
+  const body = document.createElement('div');
+  body.className = 'diagnostic-body';
+
+  const name = document.createElement('span');
+  name.className = 'diagnostic-name';
+  name.textContent = check.name;
+
+  const detail = document.createElement('span');
+  detail.className = 'diagnostic-detail';
+  detail.textContent = check.detail;
+
+  body.append(name, detail);
+  row.append(icon, body);
+  return row;
+}
+
+
+/**
+ * Copy the last diagnostics run as plain text, for pasting into a bug report.
+ *
+ * @returns {Promise<void>}
+ */
+async function handleCopyDiagnostics() {
+  if (!lastDiagnostics) return;
+
+  const report = lastDiagnostics
+    .map((c) => `[${c.status.toUpperCase().padEnd(4)}] ${c.name}: ${c.detail}`)
+    .join('\n');
+
+  try {
+    await navigator.clipboard.writeText(`SilentScribe diagnostics\n${report}`);
+    dom.btnCopyDiagnostics.textContent = 'Copied';
+    setTimeout(() => { dom.btnCopyDiagnostics.textContent = 'Copy report'; }, 2000);
+  } catch (err) {
+    console.warn(LOG_PREFIX, 'Clipboard write failed:', err);
+    dom.btnCopyDiagnostics.textContent = 'Could not copy — see console';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BRING-YOUR-OWN-KEY PROVIDER SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Build the provider settings controls and wire them to storage.
+ *
+ * Every field writes straight through to chrome.storage.local, so the settings
+ * screen has no save button and no unsaved state to lose.
+ *
+ * @returns {void}
+ */
+function setupLlmSettings() {
+  if (!dom.llmProvider) return;
+
+  // Populate the two fixed dropdowns once.
+  dom.llmProvider.replaceChildren(
+    ...Object.entries(PROVIDERS).map(([id, preset]) => new Option(preset.label, id)),
+  );
+  dom.llmFormat.replaceChildren(
+    ...WIRE_FORMATS.map((format) => new Option(format.label, format.value)),
+  );
+
+  dom.llmProvider.addEventListener('change', async (event) => {
+    clearTestResult();
+    renderLlmSettings(await setLlmConfig({ provider: event.target.value }));
+  });
+
+  dom.llmFormat.addEventListener('change', async (event) => {
+    clearTestResult();
+    await setLlmConfig({ format: event.target.value });
+  });
+
+  // Text fields save as the user types, debounced so a long key is written once.
+  bindLlmField(dom.llmBaseUrl, (value) => ({ baseUrl: value.trim().replace(/\/+$/, '') }));
+  bindLlmField(dom.llmApiKey,  (value) => ({ apiKey: value.trim() }));
+  bindLlmField(dom.llmModel,   (value) => ({ model: value.trim() }));
+
+  dom.btnToggleKey.addEventListener('click', () => {
+    const hidden = dom.llmApiKey.type === 'password';
+    dom.llmApiKey.type = hidden ? 'text' : 'password';
+    dom.btnToggleKey.textContent = hidden ? 'Hide' : 'Show';
+  });
+
+  dom.btnLoadModels.addEventListener('click', handleLoadModels);
+  dom.btnTestLlm.addEventListener('click', handleTestConnection);
+
+  dom.llmKeysLink.addEventListener('click', (event) => {
+    event.preventDefault();
+    if (dom.llmKeysLink.dataset.url) {
+      chrome.tabs.create({ url: dom.llmKeysLink.dataset.url });
+    }
+  });
+
+  getLlmConfig()
+    .then(renderLlmSettings)
+    .catch((err) => console.error(LOG_PREFIX, 'Could not load provider settings:', err));
+}
+
+
+/**
+ * Save one text field to storage, 400 ms after the user stops typing.
+ *
+ * @param {HTMLInputElement} input - The field.
+ * @param {(value: string) => Object} toPatch - Maps the field value to a config patch.
+ * @returns {void}
+ */
+function bindLlmField(input, toPatch) {
+  let debounceId = null;
+
+  input.addEventListener('input', () => {
+    clearTimeout(debounceId);
+    clearTestResult();
+    debounceId = setTimeout(() => setLlmConfig(toPatch(input.value)), 400);
+  });
+
+  // Blur commits immediately, so closing Settings never loses the last keystroke.
+  input.addEventListener('blur', () => {
+    clearTimeout(debounceId);
+    setLlmConfig(toPatch(input.value));
+  });
+}
+
+
+/**
+ * Reflect a config into the settings controls.
+ *
+ * @param {Object} config - Resolved config from getLlmConfig().
+ * @returns {void}
+ */
+function renderLlmSettings(config) {
+  const preset = PROVIDERS[config.provider] || PROVIDERS.custom;
+
+  dom.llmProvider.value = config.provider;
+  dom.llmFormat.value   = config.format;
+  dom.llmBaseUrl.value  = config.baseUrl;
+  dom.llmApiKey.value   = config.apiKey;
+  dom.llmModel.value    = config.model;
+
+  // The on-device engine needs no URL, key, or model.
+  dom.llmByokFields.hidden = config.provider === 'builtin';
+
+  // Only the custom preset exposes the wire-format choice; for a known provider
+  // the format is fixed and showing it would only invite a wrong answer.
+  dom.llmFormatField.hidden = config.provider !== 'custom';
+
+  dom.llmNote.textContent = preset.note || '';
+  dom.llmNote.hidden = !preset.note;
+
+  dom.llmKeysLink.hidden = !preset.keysUrl;
+  dom.llmKeysLink.dataset.url = preset.keysUrl || '';
+
+  dom.llmApiKey.placeholder = preset.needsKey ? 'Paste your key' : 'Not required';
+}
+
+
+/**
+ * Ask the provider which models this key can use, and offer them as
+ * autocomplete on the model field.
+ *
+ * @returns {Promise<void>}
+ */
+async function handleLoadModels() {
+  dom.btnLoadModels.disabled = true;
+  showTestResult('pending', 'Loading models...');
+
+  try {
+    const models = await listModels();
+    dom.llmModelOptions.replaceChildren(...models.map((id) => new Option(id)));
+    showTestResult(
+      models.length ? 'ok' : 'error',
+      models.length
+        ? `${models.length} models available. Click the model field to pick one.`
+        : 'The provider returned no models.',
+    );
+  } catch (err) {
+    showTestResult('error', err.message);
+  } finally {
+    dom.btnLoadModels.disabled = false;
+  }
+}
+
+
+/**
+ * Ping the configured provider and report whether the key, URL, and model all
+ * work. This is the check to run whenever notes stop generating.
+ *
+ * @returns {Promise<void>}
+ */
+async function handleTestConnection() {
+  dom.btnTestLlm.disabled = true;
+  showTestResult('pending', 'Contacting the provider...');
+
+  try {
+    const result = await testConnection();
+    showTestResult(
+      result.ok ? 'ok' : 'error',
+      `${result.ok ? 'Working' : 'Failed'} — ${result.model} — ${result.latencyMs} ms. ${result.detail}`,
+    );
+  } catch (err) {
+    showTestResult('error', err.message);
+  } finally {
+    dom.btnTestLlm.disabled = false;
+    refreshAiHelpText();
+  }
+}
+
+
+/**
+ * Show a status line under the Test button.
+ *
+ * @param {'ok'|'error'|'pending'} kind - Which style to apply.
+ * @param {string} message - Text to show.
+ * @returns {void}
+ */
+function showTestResult(kind, message) {
+  dom.llmTestResult.textContent = message;
+  dom.llmTestResult.className = `settings-status is-${kind}`;
+  dom.llmTestResult.hidden = false;
+}
+
+
+/**
+ * Hide the status line, because the config changed and it no longer applies.
+ *
+ * @returns {void}
+ */
+function clearTestResult() {
+  if (dom.llmTestResult) dom.llmTestResult.hidden = true;
 }
 
 

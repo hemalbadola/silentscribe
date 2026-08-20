@@ -1,0 +1,28 @@
+{
+  "_comment": [
+    "SilentScribe managed config. Host this file and put its RAW url in",
+    ".claude/.env as SILENTSCRIBE_CONFIG_URL, or in DEFAULT_CONFIG_URL in",
+    "utils/remote-config.js.",
+    "",
+    "NO API KEY GOES IN THIS FILE, and the extension will ignore one if present.",
+    "A key inside an extension is readable by anyone who installs it and shows in",
+    "the network panel of every machine that runs it, so each user enters their",
+    "own in Settings. This file only saves them typing the provider and model.",
+    "",
+    "Every installed copy re-reads this once an hour, on browser start, and on",
+    "install. Unknown fields are ignored so it can grow safely. Delete _comment",
+    "in the real file.",
+    "",
+    "Chrome does not auto-update an unpacked extension. 'version' and",
+    "'downloadUrl' drive an in-panel banner; installing stays a manual step."
+  ],
+  "version": "1.0.0",
+  "downloadUrl": "https://github.com/CHANGE-ME/silentscribe/releases/latest",
+  "notes": "What changed in this release.",
+  "message": "",
+  "llm": {
+    "provider": "nvidia",
+    "baseUrl": "https://integrate.api.nvidia.com/v1",
+    "model": "meta/llama-3.1-8b-instruct"
+  }
+}

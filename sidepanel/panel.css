@@ -718,15 +718,6 @@ p { color: var(--text-secondary); }
   border-radius: var(--radius-full);
 }
 
-#complete-platform {
-  cursor: pointer;
-  transition: all var(--duration-fast);
-}
-#complete-platform:hover {
-  background: var(--bg-glass-hover);
-  color: var(--primary-color);
-}
-
 .chip-icon { font-size: 11px; }
 .chip-text { font-weight: 500; }
 
@@ -761,7 +752,7 @@ p { color: var(--text-secondary); }
 
 .transcript-segment.active-segment {
   background: rgba(147, 51, 234, 0.15); /* light purple tint */
-  border-left: 3px solid var(--accent-primary);
+  border-left: 3px solid var(--accent);
   border-radius: 0 var(--radius-md) var(--radius-md) 0;
 }
 
@@ -1323,10 +1314,6 @@ p { color: var(--text-secondary); }
   gap: var(--sp-3);
 }
 
-.ai-state-container[hidden] {
-  display: none !important;
-}
-
 .ai-help-text {
   font-size: var(--font-xs);
   color: var(--text-tertiary);
@@ -1419,4 +1406,562 @@ p { color: var(--text-secondary); }
 
 .btn-remove-bookmark:hover {
   color: var(--danger);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SETTINGS — BYOK PROVIDER FIELDS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin-bottom: var(--sp-3);
+}
+
+.field-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  letter-spacing: 0.02em;
+}
+
+.field-input {
+  width: 100%;
+  min-width: 0;
+  padding: var(--sp-2) var(--sp-3);
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  transition: border-color 120ms ease;
+}
+
+.field-input:focus {
+  outline: none;
+  border-color: var(--border-focus);
+}
+
+.field-input::placeholder {
+  color: var(--text-tertiary);
+}
+
+select.field-input {
+  cursor: pointer;
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-secondary) 50%),
+                    linear-gradient(135deg, var(--text-secondary) 50%, transparent 50%);
+  background-position: calc(100% - 16px) 50%, calc(100% - 11px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: var(--sp-8);
+}
+
+.field-row {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: stretch;
+}
+
+.field-row .field-input {
+  flex: 1 1 auto;
+}
+
+.btn-inline {
+  flex: 0 0 auto;
+  padding: var(--sp-2) var(--sp-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.settings-hint {
+  margin: 0 0 var(--sp-3);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+
+.settings-hint a {
+  color: var(--accent);
+}
+
+.settings-status {
+  margin: var(--sp-3) 0 0;
+  padding: var(--sp-2) var(--sp-3);
+  font-size: 12px;
+  line-height: 1.5;
+  border-radius: var(--radius-sm);
+  word-break: break-word;
+}
+
+.settings-status.is-ok {
+  color: var(--accent);
+  background: var(--accent-muted);
+}
+
+.settings-status.is-error {
+  color: var(--danger);
+  background: var(--danger-muted);
+}
+
+.settings-status.is-pending {
+  color: var(--text-secondary);
+  background: var(--bg-glass);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   STOP CHOICE — TRANSCRIBE OR KEEP THE VIDEO ONLY
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.stop-alt {
+  margin-top: var(--sp-4);
+  font-size: 13px;
+}
+
+.stop-hint {
+  margin: var(--sp-2) 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: center;
+  color: var(--text-tertiary);
+}
+
+.btn-stop:disabled,
+.stop-alt:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TRANSCRIBE-LATER PROMPT
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.transcribe-prompt {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-6) var(--sp-4);
+  text-align: center;
+  background: var(--bg-glass);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.transcribe-prompt-text {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.transcribe-prompt-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+
+.transcribe-prompt .btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SHORTCUT SETUP CARD
+   Rendered entirely by sidepanel/shortcut-setup.js. No markup in panel.html.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.shortcut-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+}
+
+/* Unbound state — an emerald edge asks for attention without alarming */
+.shortcut-card-alert {
+  border-color: var(--border-focus);
+}
+
+.shortcut-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+}
+
+.shortcut-title {
+  font-size: var(--font-sm);
+}
+
+.shortcut-lead {
+  font-size: var(--font-xs);
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+/* The combination Chrome actually assigned, one <kbd> per key */
+.shortcut-combo {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.shortcut-key {
+  min-width: 24px;
+  padding: 3px 7px;
+  font-family: var(--font-family);
+  font-size: var(--font-sm);
+  font-weight: 600;
+  text-align: center;
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.shortcut-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: 0;
+  padding-left: var(--sp-5);
+  font-size: var(--font-xs);
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.shortcut-steps li::marker { color: var(--text-tertiary); }
+
+.shortcut-note {
+  font-size: var(--font-xs);
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+
+/* Quiet affordance — reads as a link so it never competes with Record */
+.shortcut-change {
+  align-self: flex-start;
+  padding: 0;
+  background: none;
+  border: none;
+  font-size: var(--font-xs);
+  color: var(--text-tertiary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  transition: color var(--duration-fast) var(--ease-out);
+}
+
+.shortcut-change:hover { color: var(--accent); }
+
+.shortcut-change:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TRANSCRIPT TAB — BACKGROUND JOB STATUS
+   There is no transcription screen. The recording plays immediately and these
+   blocks report what is happening behind it.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.transcript-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  background: var(--bg-glass);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.transcript-progress-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+}
+
+.transcript-progress-head .progress-label {
+  font-size: var(--font-xs);
+  color: var(--text-secondary);
+}
+
+.transcript-progress-note {
+  margin: 0;
+  font-size: var(--font-xs);
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+
+.transcript-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-4);
+  background: var(--danger-muted);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-md);
+}
+
+.transcript-error-text {
+  margin: 0;
+  font-size: var(--font-xs);
+  line-height: 1.55;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
+.transcript-error .btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DIAGNOSTICS AND STRUCTURED ERRORS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.diagnostics {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  margin: var(--sp-3) 0;
+}
+
+.diagnostics-summary {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--font-xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.diagnostic-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-glass);
+  border-left: 2px solid var(--text-tertiary);
+  border-radius: var(--radius-sm);
+}
+
+.diagnostic-row.is-ok   { border-left-color: var(--accent); }
+.diagnostic-row.is-warn { border-left-color: #E0A800; }
+.diagnostic-row.is-fail { border-left-color: var(--danger); }
+
+.diagnostic-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.5;
+  text-align: center;
+  color: var(--text-tertiary);
+}
+
+.diagnostic-row.is-ok   .diagnostic-icon { color: var(--accent); }
+.diagnostic-row.is-warn .diagnostic-icon { color: #E0A800; }
+.diagnostic-row.is-fail .diagnostic-icon { color: var(--danger); }
+
+.diagnostic-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.diagnostic-name {
+  font-size: var(--font-xs);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.diagnostic-detail {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+/* Structured errors — cause, then action, then the raw text folded away */
+
+.error-action,
+.transcript-error-action {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--font-xs);
+  line-height: 1.55;
+  color: var(--accent);
+}
+
+.transcript-error-title {
+  margin: 0;
+  font-size: var(--font-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.error-raw-details {
+  width: 100%;
+  margin-top: var(--sp-3);
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.error-raw-details summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.error-raw-details summary:hover { color: var(--text-secondary); }
+
+.error-raw {
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2);
+  max-height: 160px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LIVE TRANSCRIPT (optional, off by default)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.live-transcript {
+  width: 100%;
+  max-height: 150px;
+  margin-top: var(--sp-5);
+  padding: var(--sp-3);
+  overflow-y: auto;
+  text-align: left;
+  background: var(--bg-glass);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.live-transcript-heading {
+  margin: 0 0 var(--sp-2);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.live-transcript-text {
+  margin: 0;
+  font-size: var(--font-xs);
+  line-height: 1.5;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+/* Plain checkbox rows in Settings */
+
+.settings-toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-2) 0;
+  cursor: pointer;
+}
+
+.settings-toggle-row input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.settings-toggle-label {
+  font-size: var(--font-xs);
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.info-chip-action { cursor: pointer; }
+
+.info-chip-action:hover { color: var(--accent); }
+
+.info-chip-action:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.complete-title {
+  margin: 0;
+  font-size: 1.2rem;
+  color: var(--text-primary);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ONBOARDING TOUR
+   Rendered by sidepanel/onboarding.js into #onboarding-tour.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.onboarding-tour {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-4);
+}
+
+.onboarding-progress {
+  font-size: var(--font-xs);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* Tour cards carry several paragraphs, so they read left-aligned rather than
+   centred like the single-message .onboarding-card. */
+.onboarding-step,
+.onboarding-shortcut {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/* These children keep their own margins for the Settings view. Here the flex
+   gap above already supplies the spacing, so the margins would double it. */
+.onboarding-step > *,
+.onboarding-shortcut > * {
+  margin: 0;
+}
+
+.onboarding-nav {
+  display: flex;
+  gap: var(--sp-2);
+}
+
+.onboarding-nav .btn {
+  flex: 1;
+  padding: var(--sp-3) var(--sp-4);
+}
+
+.onboarding-skip {
+  border: none;
+  font-size: var(--font-xs);
+  color: var(--text-tertiary);
+}
+
+.onboarding-skip:hover {
+  background: transparent;
+  color: var(--text-secondary);
 }

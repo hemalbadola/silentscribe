@@ -29,15 +29,14 @@ import {
   createSession,
   finalizeSession,
   updateSessionStatus,
-  updateSessionMetadata,
   saveTranscript,
   generateSessionId,
   getSession,
   getTranscript,
 } from '../storage/db.js';
 import { exportTxt, exportSrt, exportJson, exportMd } from '../utils/export.js';
-
-import { cleanupTranscript, generateAiTitle } from '../utils/ai.js';
+import { REFRESH_ALARM, fetchRemoteConfig, isRemoteConfigured } from '../utils/remote-config.js';
+import { cleanupTranscript } from '../utils/ai.js';
 
 
 // ============================================================================
@@ -68,6 +67,8 @@ let keepalivePort = null;
  * @param {chrome.runtime.InstalledDetails} details - Install event details.
  */
 chrome.runtime.onInstalled.addListener(async (details) => {
+  scheduleConfigRefresh().catch((err) =>
+    console.warn('[SilentScribe SW] Config refresh failed:', err));
   console.log(`[SilentScribe SW] Installed — reason: ${details.reason}`);
 
   try {
@@ -99,6 +100,8 @@ chrome.runtime.onInstalled.addListener(async (details) => {
  * on browser restart. The side panel will re-check permissions on open.
  */
 chrome.runtime.onStartup.addListener(async () => {
+  scheduleConfigRefresh().catch((err) =>
+    console.warn('[SilentScribe SW] Config refresh failed:', err));
   console.log('[SilentScribe SW] Browser startup — resetting state');
   try {
     const state = await getState();
@@ -145,7 +148,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
 
     case MSG.UI_STOP_RECORDING:
-      handleStopRecording().then(sendResponse).catch((err) => {
+      handleStopRecording(payload).then(sendResponse).catch((err) => {
         sendResponse({ error: err.message });
       });
       return true;
@@ -160,10 +163,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case MSG.UI_DISMISS_ERROR:
       handleDismissError().then(sendResponse);
-      return true;
-
-    case MSG.UI_RETURN_TO_READY:
-      setState(STATES.READY).then(sendResponse);
       return true;
 
     case MSG.UI_EXPORT:
@@ -409,8 +408,11 @@ async function handleStartRecordingWithStream(payload) {
  * 
  * @returns {Promise<{success: boolean}>}
  */
-async function handleStopRecording() {
-  console.log('[SilentScribe SW] Stopping recording...');
+async function handleStopRecording(payload) {
+  // Default to transcribing, so the keyboard shortcut and any older caller
+  // that sends no payload keep the original behaviour.
+  const transcribe = payload?.transcribe !== false;
+  console.log(`[SilentScribe SW] Stopping recording (transcribe: ${transcribe})...`);
 
   try {
     const state = await getState();
@@ -419,18 +421,38 @@ async function handleStopRecording() {
       return { success: false, error: 'Not recording' };
     }
 
+    // Record the choice before the offscreen document reports back, so
+    // handleCaptureComplete knows whether a transcription is coming.
+    await updateMetadata({ transcribe });
+
     // Finalize the session's end time in IndexedDB
     await finalizeSession(state.sessionId);
 
-    // Tell the offscreen document to stop capturing
+    // Tell the offscreen document to stop capturing. It only starts
+    // transcription when we ask it to.
     await chrome.runtime.sendMessage({
       type: MSG.OFFSCREEN_STOP_CAPTURE,
+      payload: { transcribe },
     });
 
-    // Transition to PROCESSING — transcription will start in the offscreen doc
-    await updateSessionStatus(state.sessionId, SESSION_STATUS.TRANSCRIBING);
-    await setState(STATES.PROCESSING);
-    updateBadge('processing');
+    // The recording is written and playable, so show it straight away. There is
+    // no waiting screen: transcription, when asked for, runs behind the video
+    // and drops into the transcript tab when it finishes.
+    await updateSessionStatus(
+      state.sessionId,
+      transcribe ? SESSION_STATUS.TRANSCRIBING : SESSION_STATUS.RECORDED,
+    );
+    await setState(STATES.COMPLETE, {
+      sessionId: state.sessionId,
+      transcribe,
+      transcribingSessionId: transcribe ? state.sessionId : null,
+    });
+    updateBadge(transcribe ? 'processing' : 'complete');
+
+    if (!transcribe) {
+      await closeOffscreenDocument();
+      setTimeout(() => updateBadge('idle'), 3000);
+    }
 
     console.log(`[SilentScribe SW] Recording stopped — session: ${state.sessionId}`);
     return { success: true };
@@ -444,6 +466,39 @@ async function handleStopRecording() {
     return { success: false, error: err.message };
   }
 }
+
+
+// ============================================================================
+// MANAGED CONFIG REFRESH
+// ============================================================================
+
+/**
+ * Pull the published config on a schedule.
+ *
+ * This is how an install receives a new API key, model, or notice without
+ * being reinstalled — and the only practical way to retire a leaked key,
+ * since the bundled one is readable by anyone who has the extension.
+ *
+ * An alarm is used rather than setInterval because the service worker is
+ * stopped whenever it goes idle; alarms wake it back up.
+ *
+ * @returns {Promise<void>}
+ */
+async function scheduleConfigRefresh() {
+  if (!(await isRemoteConfigured())) {
+    console.info('[SilentScribe SW] No config URL set — skipping managed config refresh.');
+    return;
+  }
+
+  await chrome.alarms.create(REFRESH_ALARM, { periodInMinutes: 60, delayInMinutes: 1 });
+  await fetchRemoteConfig();
+}
+
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== REFRESH_ALARM) return;
+  await fetchRemoteConfig();
+});
 
 
 // ============================================================================
@@ -495,6 +550,15 @@ async function ensureOffscreenDocument() {
  * @returns {Promise<void>}
  */
 async function closeOffscreenDocument() {
+  // The offscreen document holds the live MediaRecorder. Now that transcription
+  // finishes in the background, a transcription that ends while a new recording
+  // is running must not close the document out from under it.
+  const state = await getState();
+  if (state.state === STATES.RECORDING) {
+    console.log('[SilentScribe SW] Keeping the offscreen document — a recording is active');
+    return;
+  }
+
   try {
     const existingContexts = await chrome.runtime.getContexts({
       contextTypes: ['OFFSCREEN_DOCUMENT'],
@@ -688,9 +752,13 @@ async function handleMeetingStateChanged(payload) {
  */
 async function handleCaptureComplete(payload) {
   console.log(`[SilentScribe SW] Capture complete for session: ${payload.sessionId}`);
-  
-  // V2: Transcription is deferred to Intelligence Plane but still
-  // triggered automatically for now. We stay in PROCESSING state.
+
+  // When the user chose to skip transcription, handleStopRecording has already
+  // marked the session RECORDED. Overwriting that with TRANSCRIBING would leave
+  // a finished recording looking like it is stuck mid-transcription.
+  const state = await getState();
+  if (state.transcribe === false) return;
+
   await updateSessionStatus(payload.sessionId, SESSION_STATUS.TRANSCRIBING);
 }
 
@@ -719,45 +787,35 @@ async function handleTranscriptionComplete(payload) {
   console.log(`[SilentScribe SW] Transcription complete for session: ${payload.sessionId}`);
 
   try {
-    // 1. Run AI cleanup on the raw segments before saving
-    console.log('[SilentScribe SW] Running AI Transcript Cleanup...');
-    chrome.runtime.sendMessage({
-      type: MSG.TRANSCRIPTION_PROGRESS,
-      payload: { progress: 1.0, status: 'Running AI Transcript Cleanup...' }
-    }).catch(() => {});
-    
-    const cleanedTranscript = await cleanupTranscript(payload.transcript);
-
-    // Save the cleaned transcript to IndexedDB
-    await saveTranscript(payload.sessionId, cleanedTranscript);
-
-    // 2. Generate AI Title
-    console.log('[SilentScribe SW] Generating AI Meeting Title...');
-    chrome.runtime.sendMessage({
-      type: MSG.TRANSCRIPTION_PROGRESS,
-      payload: { progress: 1.0, status: 'Generating meeting title...' }
-    }).catch(() => {});
-    
-    const aiTitle = await generateAiTitle(cleanedTranscript);
-    if (aiTitle) {
-      await updateSessionMetadata(payload.sessionId, { title: aiTitle });
+    // Optional pass to fix stutters and mis-hearings. Off by default because it
+    // sends the transcript to the provider without the user asking, and costs a
+    // request. cleanupTranscript returns the original segments on any failure,
+    // so a provider outage can never lose a transcript.
+    let segments = payload.transcript;
+    const { transcriptCleanup } = await chrome.storage.local.get('transcriptCleanup');
+    if (transcriptCleanup) {
+      console.log('[SilentScribe SW] Running transcript cleanup...');
+      segments = await cleanupTranscript(segments);
     }
 
-    // Transition to COMPLETE state
+    await saveTranscript(payload.sessionId, segments);
     await updateSessionStatus(payload.sessionId, SESSION_STATUS.COMPLETE);
-    await setState(STATES.COMPLETE, { sessionId: payload.sessionId });
+
+    // Transcription is background work now. Clear the in-progress marker and
+    // leave the current view alone — the user may be watching the recording,
+    // or may already have started another one. The side panel picks the new
+    // transcript up from TRANSCRIPTION_COMPLETE.
+    await updateMetadata({ transcribingSessionId: null, transcriptionError: null });
+
     updateBadge('complete');
-
-    // Close the offscreen document — no longer needed
     await closeOffscreenDocument();
-
-    // Clear the badge after 3 seconds
     setTimeout(() => updateBadge('idle'), 3000);
 
   } catch (err) {
     console.error('[SilentScribe SW] Failed to save transcript:', err);
-    await setState(STATES.ERROR, {
-      error: 'Transcription completed but failed to save results.',
+    await updateMetadata({
+      transcribingSessionId: null,
+      transcriptionError: 'The transcript was generated but could not be saved.',
     });
   }
 }
@@ -771,17 +829,24 @@ async function handleTranscriptionComplete(payload) {
 async function handleTranscriptionError(payload) {
   console.error(`[SilentScribe SW] Transcription error: ${payload.error}`);
 
-  // Still transition to COMPLETE if we have audio — the user can retry
-  // transcription later. Don't lose their recording.
+  // A failed transcription must not take over the screen. The recording itself
+  // is safe and playable, and this used to throw the user into the full-screen
+  // ERROR view with a "retry" prompt. Record the failure against the session
+  // and let the transcript tab show it in place.
   const state = await getState();
-  await updateSessionStatus(state.sessionId, SESSION_STATUS.ERROR);
-  await setState(STATES.ERROR, {
-    error: `Transcription failed: ${payload.error}. Your audio recording is saved and you can retry.`,
-    sessionId: state.sessionId,
-  });
-  updateBadge('error');
+  const sessionId = state.transcribingSessionId || state.sessionId;
 
-  // Close the offscreen document
+  if (sessionId) {
+    await updateSessionStatus(sessionId, SESSION_STATUS.RECORDED);
+  }
+
+  await updateMetadata({
+    transcribingSessionId: null,
+    transcriptionError: payload.error || 'Transcription failed.',
+  });
+
+  updateBadge('error');
+  setTimeout(() => updateBadge('idle'), 3000);
   await closeOffscreenDocument();
 }
 
@@ -818,7 +883,9 @@ async function handleStartTranscription(payload) {
   console.log(`[SilentScribe SW] Starting transcription for session: ${payload.sessionId}`);
 
   try {
-    await setState(STATES.PROCESSING, { sessionId: payload.sessionId });
+    // No state transition: the user stays on the recording they are watching.
+    // Progress reaches the transcript tab through TRANSCRIPTION_PROGRESS.
+    await updateMetadata({ transcribingSessionId: payload.sessionId });
     updateBadge('processing');
 
     await ensureOffscreenDocument();

@@ -13,7 +13,11 @@
        Shown when the extension first loads or mic permission is needed.
        ═══════════════════════════════════════════════════════════════════════ -->
   <section id="view-onboarding" class="view" hidden>
-    <div class="view-content onboarding-layout">
+    <!-- The guided tour renders here on first run. The static cards below are
+         the fallback for a returning user who only needs the permission ask. -->
+    <div id="onboarding-tour" class="view-content onboarding-layout" hidden></div>
+
+    <div id="onboarding-basic" class="view-content onboarding-layout">
       <!-- Branding -->
       <div class="brand">
         <div class="brand-icon" aria-hidden="true">🎙️</div>
@@ -83,15 +87,8 @@
         </label>
       </div>
 
-      <!-- Recording Instructions -->
-      <div class="card glass-card info-card">
-        <div class="card-icon-small" aria-hidden="true">💡</div>
-        <p class="instruction-text">
-          To start recording in the background, press <kbd class="hotkey-inline">⌥+Shift+R</kbd> (Mac) or <kbd class="hotkey-inline">Alt+Shift+R</kbd> (Windows).
-          <br><br>
-          Or, click the SilentScribe icon in your browser toolbar!
-        </p>
-      </div>
+      <!-- Recording shortcut — card is built by sidepanel/shortcut-setup.js -->
+      <div id="shortcut-setup"></div>
 
       <!-- Past sessions -->
       <div class="sessions-section">
@@ -145,44 +142,22 @@
         <span id="platform-name" class="platform-name">Google Meet</span>
       </div>
 
-      <!-- Stop button -->
-      <button id="btn-stop" class="btn-stop" type="button" aria-label="Stop recording">
+      <!-- Stop: transcribe, or keep the video only -->
+      <button id="btn-stop" class="btn-stop" type="button" aria-label="Stop recording and transcribe">
         <span class="stop-icon" aria-hidden="true"></span>
       </button>
-      <p class="stop-label">Stop Recording</p>
+      <p class="stop-label">Stop &amp; Transcribe</p>
 
-      <!-- Live Transcript -->
-      <div class="live-transcript-container" style="margin-top: 24px; padding: 12px; background: rgba(0,0,0,0.05); border-radius: 8px; width: 100%; text-align: left; max-height: 150px; overflow-y: auto;">
-        <h4 style="margin: 0 0 8px 0; font-size: 12px; opacity: 0.7; text-transform: uppercase;">Live Transcript</h4>
-        <p id="live-transcript-text" style="margin: 0; font-size: 14px; line-height: 1.4; color: var(--text-color);">Listening...</p>
+      <button id="btn-stop-video-only" class="btn btn-ghost stop-alt" type="button">
+        Stop — save video only
+      </button>
+
+      <!-- Live transcript, only populated when the setting is on -->
+      <div id="live-transcript" class="live-transcript" hidden>
+        <h4 class="live-transcript-heading">Live transcript</h4>
+        <p id="live-transcript-text" class="live-transcript-text">Listening…</p>
       </div>
-    </div>
-  </section>
-
-  <!-- ═══════════════════════════════════════════════════════════════════════
-       View 4: Processing (PROCESSING state)
-       Transcription in progress — shows spinner and progress bar.
-       ═══════════════════════════════════════════════════════════════════════ -->
-  <section id="view-processing" class="view" hidden>
-    <div class="view-content processing-layout">
-      <!-- Spinner -->
-      <div class="spinner" aria-hidden="true">
-        <div class="spinner-ring"></div>
-      </div>
-
-      <h2 class="processing-title">Transcribing…</h2>
-
-      <!-- Progress bar -->
-      <div class="progress-container">
-        <div class="progress-track">
-          <div id="progress-bar" class="progress-fill" style="width: 0%;" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
-        </div>
-        <span id="progress-label" class="progress-label">0%</span>
-      </div>
-
-      <p class="processing-note">
-        This may take a few minutes depending on recording length.
-      </p>
+      <p class="stop-hint">Skips transcription. You can transcribe the recording later.</p>
     </div>
   </section>
 
@@ -197,7 +172,7 @@
         <button id="btn-back-complete" class="btn-icon" aria-label="Back" title="Back to list" style="margin-right: 12px; font-size: 1.2rem;">
           ←
         </button>
-        <h2 id="complete-title" style="font-size: 1.2rem; margin: 0; color: var(--text-color);">Recording Details</h2>
+        <h2 id="complete-title" class="complete-title">Recording Details</h2>
       </div>
 
       <!-- Session info bar -->
@@ -207,7 +182,8 @@
             <span class="chip-icon" aria-hidden="true">⏱️</span>
             <span class="chip-text">--:--</span>
           </span>
-          <span id="complete-platform" class="info-chip">
+          <span id="complete-platform" class="info-chip info-chip-action"
+                role="button" tabindex="0" title="Ask the model to re-read the transcript and name this recording">
             <span class="chip-icon" aria-hidden="true">📹</span>
             <span class="chip-text">—</span>
           </span>
@@ -226,8 +202,46 @@
 
       <!-- Tab 1: Transcript -->
       <div id="tab-content-transcript" class="tab-content active">
+        <!-- Shown while transcription runs behind the video -->
+        <div id="transcript-progress" class="transcript-progress" hidden>
+          <div class="transcript-progress-head">
+            <span class="spinner spinner-small" aria-hidden="true"><span class="spinner-ring"></span></span>
+            <span id="progress-label" class="progress-label">Starting…</span>
+          </div>
+          <div class="progress-track">
+            <div id="progress-bar" class="progress-fill" style="width: 0%;" role="progressbar"
+                 aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+          </div>
+          <p class="transcript-progress-note">
+            The recording is ready to watch now. The transcript appears here when it is done.
+          </p>
+        </div>
+
+        <!-- Shown when a transcription attempt failed -->
+        <div id="transcript-error" class="transcript-error" hidden>
+          <p id="transcript-error-title" class="transcript-error-title"></p>
+          <p id="transcript-error-text" class="transcript-error-text"></p>
+          <p id="transcript-error-action" class="transcript-error-action"></p>
+          <details id="transcript-error-details" class="error-raw-details" hidden>
+            <summary>Technical detail</summary>
+            <pre id="transcript-error-raw" class="error-raw"></pre>
+          </details>
+          <button id="btn-retry-transcription" class="btn" type="button">Try again</button>
+        </div>
+
+        <!-- Offered when the recording was saved without transcribing -->
+        <div id="transcribe-prompt" class="transcribe-prompt" hidden>
+          <p class="transcribe-prompt-text">This recording has no transcript yet.</p>
+          <button id="btn-transcribe-now" class="btn btn-primary" type="button">
+            <span class="btn-icon">✍️</span> Transcribe now
+          </button>
+          <p class="transcribe-prompt-hint">
+            Runs Whisper on your computer. Long recordings take a few minutes.
+          </p>
+        </div>
+
         <!-- Search bar -->
-        <div class="search-container">
+        <div id="transcript-search-container" class="search-container">
           <input type="text" id="transcript-search" class="search-input" placeholder="Search transcript..." aria-label="Search transcript" />
           <span class="search-icon" aria-hidden="true">🔍</span>
         </div>
@@ -246,12 +260,13 @@
           <button id="btn-generate-ai" class="btn btn-primary">
             <span class="btn-icon">✨</span> Generate AI Notes
           </button>
-          <p class="ai-help-text">Uses on-device AI. No data leaves your computer.</p>
+          <p id="ai-help-text" class="ai-help-text">Checking the notes engine...</p>
         </div>
-        
+
         <div id="ai-loading" class="ai-state-container" hidden>
           <div class="spinner spinner-small" aria-hidden="true"><div class="spinner-ring"></div></div>
           <p id="ai-progress-text">Analyzing transcript...</p>
+          <button id="btn-cancel-ai" type="button" class="btn btn-ghost btn-inline">Cancel</button>
         </div>
         
         <div id="ai-error" class="ai-state-container" hidden>
@@ -279,7 +294,7 @@
 
       <!-- Export buttons -->
       <div class="export-row">
-        <button id="btn-export-webm" class="btn btn-export" type="button" data-format="webm" aria-label="Export Video">
+        <button id="btn-export-webm" class="btn btn-export" type="button" data-format="webm" aria-label="Export the recording as video">
           <span class="export-icon" aria-hidden="true">🎬</span> Video
         </button>
         <button id="btn-export-txt" class="btn btn-export" type="button" data-format="txt" aria-label="Export as plain text">
@@ -310,8 +325,13 @@
   <section id="view-error" class="view" hidden>
     <div class="view-content error-layout">
       <div class="error-icon" aria-hidden="true">⚠️</div>
-      <h2 class="error-title">Something went wrong</h2>
+      <h2 id="error-title" class="error-title">Something went wrong</h2>
       <p id="error-message" class="error-message">An unexpected error occurred.</p>
+      <p id="error-action" class="error-action"></p>
+      <details id="error-raw-details" class="error-raw-details" hidden>
+        <summary>Technical detail</summary>
+        <pre id="error-raw" class="error-raw"></pre>
+      </details>
       <button id="btn-dismiss-error" class="btn btn-primary" type="button">Try Again</button>
     </div>
   </section>
@@ -332,6 +352,104 @@
           ✖️
         </button>
       </header>
+
+      <div class="settings-group">
+        <h3 class="settings-heading">Meeting Notes Engine</h3>
+        <p class="settings-description">
+          Choose what writes your meeting notes. The on-device option costs nothing and
+          sends no data anywhere. A provider key gives better notes and handles long meetings.
+        </p>
+
+        <label class="settings-field">
+          <span class="field-label">Provider</span>
+          <select id="llm-provider" class="field-input"></select>
+        </label>
+
+        <p id="llm-note" class="settings-hint" hidden></p>
+
+        <div id="llm-byok-fields" hidden>
+          <label class="settings-field" id="field-llm-format" hidden>
+            <span class="field-label">API format</span>
+            <select id="llm-format" class="field-input"></select>
+          </label>
+
+          <label class="settings-field">
+            <span class="field-label">Base URL</span>
+            <input id="llm-base-url" class="field-input" type="url" spellcheck="false"
+                   autocomplete="off" placeholder="https://api.example.com/v1" />
+          </label>
+
+          <label class="settings-field">
+            <span class="field-label">API key</span>
+            <span class="field-row">
+              <input id="llm-api-key" class="field-input" type="password" spellcheck="false"
+                     autocomplete="off" placeholder="Paste your key" />
+              <button id="btn-toggle-key" type="button" class="btn btn-ghost btn-inline">Show</button>
+            </span>
+          </label>
+          <p class="settings-hint">
+            The key stays in this Chrome profile and goes only to the provider you selected.
+            It is not encrypted on disk — use a key with a spend limit.
+            <a id="link-provider-keys" href="#" hidden>Get a key</a>
+          </p>
+
+          <label class="settings-field">
+            <span class="field-label">Model</span>
+            <span class="field-row">
+              <input id="llm-model" class="field-input" list="llm-model-options"
+                     spellcheck="false" autocomplete="off" placeholder="model-id" />
+              <button id="btn-load-models" type="button" class="btn btn-ghost btn-inline">Load</button>
+            </span>
+            <datalist id="llm-model-options"></datalist>
+          </label>
+        </div>
+
+        <button id="btn-test-llm" type="button" class="btn btn-full">Test connection</button>
+        <p id="llm-test-result" class="settings-status" hidden></p>
+      </div>
+
+      <div class="settings-group">
+        <h3 class="settings-heading">Transcript Cleanup</h3>
+        <p class="settings-description">
+          After transcribing, send the transcript to your notes provider to fix
+          stutters, repetitions and obvious mis-hearings. Off by default: it
+          costs one extra request per recording, and it sends the transcript
+          automatically rather than only when you ask for notes.
+        </p>
+        <label class="settings-toggle-row">
+          <input type="checkbox" id="toggle-transcript-cleanup" />
+          <span class="settings-toggle-label">Clean up transcripts automatically</span>
+        </label>
+        <button id="btn-replay-onboarding" type="button" class="btn btn-ghost btn-full">
+          Show the setup tour again
+        </button>
+      </div>
+
+      <div class="settings-group">
+        <h3 class="settings-heading">Live Transcript</h3>
+        <p class="settings-description">
+          Show roughly what is being said while recording. This runs speech
+          recognition during capture, which competes with the recording for CPU,
+          so it is off by default. The full transcript is always produced after
+          the recording ends, whether this is on or not.
+        </p>
+        <label class="settings-toggle-row">
+          <input type="checkbox" id="toggle-live-transcript" />
+          <span class="settings-toggle-label">Show a live transcript while recording</span>
+        </label>
+      </div>
+
+      <div class="settings-group">
+        <h3 class="settings-heading">Diagnostics</h3>
+        <p class="settings-description">
+          Checks every part that can fail and reports its real state.
+        </p>
+        <button id="btn-run-diagnostics" type="button" class="btn btn-full">Run checks</button>
+        <div id="diagnostics-results" class="diagnostics" hidden></div>
+        <button id="btn-copy-diagnostics" type="button" class="btn btn-ghost btn-full" hidden>
+          Copy report
+        </button>
+      </div>
 
       <div class="settings-group">
         <h3 class="settings-heading">Transcription Accuracy</h3>

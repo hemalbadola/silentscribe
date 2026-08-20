@@ -98,7 +98,7 @@ export const MSG = Object.freeze({
   /** User requests to return to ready state from complete view. Payload: none */
   UI_RETURN_TO_READY:         'UI_RETURN_TO_READY',
 
-  /** User requests export. Payload: { sessionId: string, format: 'txt'|'srt'|'json'|'md' } */
+  /** User requests export. Payload: { sessionId: string, format: 'txt'|'srt'|'json'|'md'|'webm' } */
   UI_EXPORT:                  'UI_EXPORT',
 
   // ── Content Script → Service Worker ──────────────────────────────────
