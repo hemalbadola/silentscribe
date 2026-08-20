@@ -1,7 +1,7 @@
 {
-  "version": "1.3.1",
+  "version": "1.3.2",
   "downloadUrl": "https://github.com/hemalbadola/silentscribe/releases/latest",
-  "notes": "The model download progress now shows one honest number instead of two files fighting over the label.",
+  "notes": "The transcript tab shows one thing at a time again, instead of a finished progress bar, an empty error box and a Transcribe now offer all at once.",
   "message": "",
   "llm": {
     "provider": "nvidia",

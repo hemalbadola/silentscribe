@@ -1107,7 +1107,11 @@ async function handleTranscriptionComplete(payload) {
     // leave the current view alone — the user may be watching the recording,
     // or may already have started another one. The side panel picks the new
     // transcript up from TRANSCRIPTION_COMPLETE.
-    await updateMetadata({ transcribingSessionId: null, transcriptionError: null });
+    await updateMetadata({
+      transcribingSessionId: null,
+      transcriptionError: null,
+      transcriptionErrorSessionId: null,
+    });
 
     updateBadge('complete');
     await closeOffscreenDocument();
@@ -1118,6 +1122,7 @@ async function handleTranscriptionComplete(payload) {
     await updateMetadata({
       transcribingSessionId: null,
       transcriptionError: 'The transcript was generated but could not be saved.',
+      transcriptionErrorSessionId: payload?.sessionId || null,
     });
   }
 }
@@ -1145,9 +1150,12 @@ async function handleTranscriptionError(payload) {
     await updateSessionStatus(sessionId, SESSION_STATUS.RECORDED);
   }
 
+  // Tagged with its session: without this the panel showed one recording's
+  // failure on top of a different recording the user had opened.
   await updateMetadata({
     transcribingSessionId: null,
     transcriptionError: payload.error || 'Transcription failed.',
+    transcriptionErrorSessionId: payload.sessionId || null,
   });
 
   updateBadge('error');
@@ -1190,7 +1198,11 @@ async function handleStartTranscription(payload) {
   try {
     // No state transition: the user stays on the recording they are watching.
     // Progress reaches the transcript tab through TRANSCRIPTION_PROGRESS.
-    await updateMetadata({ transcribingSessionId: payload.sessionId, transcriptionError: null });
+    await updateMetadata({
+      transcribingSessionId: payload.sessionId,
+      transcriptionError: null,
+      transcriptionErrorSessionId: null,
+    });
     updateBadge('processing');
     transcriptionInFlight = true;
 
@@ -1223,6 +1235,7 @@ async function handleStartTranscription(payload) {
     await updateMetadata({
       transcribingSessionId: null,
       transcriptionError: 'Transcription could not be started. Try again.',
+      transcriptionErrorSessionId: payload?.sessionId || null,
     });
     updateBadge('idle');
 

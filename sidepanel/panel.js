@@ -210,6 +210,17 @@ let transcribingSessionId = null;
 let transcriptionError = null;
 
 /**
+ * What the open recording's transcript actually contains.
+ *
+ * renderTranscriptTabState needs these to pick a mode, and they were
+ * previously passed straight into a second function that toggled cards on its
+ * own — which is how two owners of the same cards came about.
+ */
+let transcriptionErrorSessionId = null;
+let transcriptSegmentCount = 0;
+let transcriptSessionTranscribed = false;
+
+/**
  * Results of the last diagnostics run, kept so Copy report can serialise them.
  *
  * @type {Object[]|null}
@@ -609,6 +620,7 @@ function handleStateTransition(stateObj) {
       activeSessionId = stateObj.sessionId;
       transcribingSessionId = stateObj.transcribingSessionId || null;
       transcriptionError = stateObj.transcriptionError || null;
+      transcriptionErrorSessionId = stateObj.transcriptionErrorSessionId || null;
       loadCompleteView(stateObj.sessionId);
       break;
 
@@ -820,6 +832,7 @@ function setupMessageListener() {
         // looking at that recording; otherwise the session list picks it up.
         transcribingSessionId = null;
         transcriptionError = null;
+        transcriptionErrorSessionId = null;
         if (message.payload?.sessionId === activeSessionId) {
           loadCompleteView(activeSessionId);
         }
@@ -828,6 +841,7 @@ function setupMessageListener() {
       case MSG.TRANSCRIPTION_ERROR:
         transcribingSessionId = null;
         transcriptionError = message.payload?.error || 'Transcription failed.';
+        transcriptionErrorSessionId = message.payload?.sessionId || null;
         if (activeSessionId) renderTranscriptTabState();
         break;
 
@@ -1956,7 +1970,8 @@ async function populateCompleteView(session) {
   renderTranscript(segments, session.speakerNames || {});
   // Transcribed with nothing found is a different state from never transcribed.
   // Offering "Transcribe now" for the first would just repeat an empty result.
-  showTranscribePrompt(segments.length === 0, Boolean(session.transcribed));
+  transcriptSegmentCount = segments.length;
+  transcriptSessionTranscribed = Boolean(session.transcribed);
   renderTranscriptTabState();
 
   // Audio player. setupAudioPlayer() keeps the object URL in module state so
@@ -1993,53 +2008,89 @@ async function populateCompleteView(session) {
  *
  * @returns {void}
  */
-function renderTranscriptTabState() {
-  const running = Boolean(activeSessionId) && transcribingSessionId === activeSessionId;
-  const failed = Boolean(transcriptionError) && !running;
+/**
+ * Decide which single card the transcript tab should show.
+ *
+ * Separated from the DOM writes purely so the decision can be tested. The
+ * failure it exists to prevent is more than one card being visible at once.
+ *
+ * @param {Object} s - { running, explained, segments, transcribed }
+ * @returns {'running'|'failed'|'transcript'|'empty'|'offer'}
+ */
+export function transcriptTabMode({ running, explained, segments, transcribed }) {
+  if (running) return 'running';
+  if (explained?.title) return 'failed';
+  if (segments > 0) return 'transcript';
+  return transcribed ? 'empty' : 'offer';
+}
 
-  if (dom.transcriptProgress) dom.transcriptProgress.hidden = !running;
-  if (dom.transcriptError) dom.transcriptError.hidden = !failed;
-  if (failed) {
-    const explained = explainError(transcriptionError);
+
+function renderTranscriptTabState() {
+  // ONE owner, ONE mode. This and showTranscribePrompt used to toggle the same
+  // three cards independently, each hiding only what it knew about, so the
+  // result depended on which ran last — and all three could end up on screen
+  // together: a finished progress bar reading "Complete 100%", an error card
+  // with no message in it, and an offer to transcribe, stacked.
+  const running = Boolean(activeSessionId) && transcribingSessionId === activeSessionId;
+
+  // An error with no explanation is not worth a card. The empty red box with a
+  // lone "Try again" button came from showing this before its text was set.
+  // Only for the recording it actually happened to. An untagged error is from
+  // an older build and is shown on whatever is open, which is the old behaviour.
+  const errorIsForThisSession = !transcriptionErrorSessionId
+    || transcriptionErrorSessionId === activeSessionId;
+  const explained = transcriptionError && errorIsForThisSession
+    ? explainError(transcriptionError)
+    : null;
+  const failed = Boolean(explained?.title) && !running;
+
+  const mode = transcriptTabMode({
+    running,
+    explained: failed ? explained : null,
+    segments: transcriptSegmentCount,
+    transcribed: transcriptSessionTranscribed,
+  });
+
+  // Every card is set explicitly, every time. Nothing is left as it was.
+  if (dom.transcriptProgress) dom.transcriptProgress.hidden = mode !== 'running';
+  if (dom.transcriptError) dom.transcriptError.hidden = mode !== 'failed';
+  if (dom.transcribePrompt) dom.transcribePrompt.hidden = mode !== 'empty' && mode !== 'offer';
+  if (dom.searchContainer) dom.searchContainer.hidden = mode !== 'transcript';
+  if (dom.transcriptContainer) dom.transcriptContainer.hidden = mode !== 'transcript';
+
+  if (mode === 'failed') {
     if (dom.transcriptErrorTitle) dom.transcriptErrorTitle.textContent = explained.title;
     if (dom.transcriptErrorText) dom.transcriptErrorText.textContent = explained.cause;
-    if (dom.transcriptErrorAction) dom.transcriptErrorAction.textContent = explained.action;
+    if (dom.transcriptErrorAction) dom.transcriptErrorAction.textContent = explained.action || '';
     // The raw message stays available but folded away, so the panel reads
     // clearly while still carrying everything needed for a bug report.
     if (dom.transcriptErrorDetails) {
-      dom.transcriptErrorDetails.hidden = !explained.known || !explained.raw;
+      dom.transcriptErrorDetails.hidden = !explained.raw || explained.raw === explained.cause;
     }
-    if (dom.transcriptErrorRaw) dom.transcriptErrorRaw.textContent = explained.raw;
+    if (dom.transcriptErrorRaw) dom.transcriptErrorRaw.textContent = explained.raw || '';
   }
+
+  if (mode === 'empty' || mode === 'offer') fillTranscribePrompt(mode === 'empty');
+
   // Re-arm the retry button whenever the failure panel comes back into view.
   if (dom.btnRetryTranscription) dom.btnRetryTranscription.disabled = running;
-
-  // The offer to transcribe makes no sense while a job is running or has just
-  // failed with its own retry button.
-  if ((running || failed) && dom.transcribePrompt) {
-    dom.transcribePrompt.hidden = true;
-    if (dom.searchContainer) dom.searchContainer.hidden = true;
-    if (dom.transcriptContainer) dom.transcriptContainer.hidden = true;
-  }
+  if (dom.btnTranscribeNow) dom.btnTranscribeNow.disabled = false;
 
   if (running) resetProgressBar();
 }
 
 
-function showTranscribePrompt(show, alreadyTranscribed = false) {
-  if (!dom.transcribePrompt) return;
-
-  dom.transcribePrompt.hidden = !show;
-  if (dom.btnTranscribeNow) dom.btnTranscribeNow.disabled = false;
-
-  // Searching and the "no segments" placeholder mean nothing without a
-  // transcript, so hide them while the offer is up.
-  if (dom.searchContainer) dom.searchContainer.hidden = show;
-  if (dom.transcriptContainer) dom.transcriptContainer.hidden = show;
-
-  if (!show) return;
-
-  const emptyResult = alreadyTranscribed;
+/**
+ * Write the wording for the "no transcript" card.
+ *
+ * Visibility is not decided here — renderTranscriptTabState owns that. This
+ * only chooses between "never transcribed" and "transcribed, found nothing",
+ * which are different situations and need different offers.
+ *
+ * @param {boolean} emptyResult - True when a run finished and found no speech.
+ * @returns {void}
+ */
+function fillTranscribePrompt(emptyResult) {
   if (dom.transcribePromptText) {
     dom.transcribePromptText.textContent = emptyResult
       ? 'No speech was detected in this recording.'
