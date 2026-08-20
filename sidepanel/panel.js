@@ -1325,8 +1325,14 @@ function updateProgressBar(payload) {
 
   // The worker's status is the informative part: it distinguishes a 145 MB
   // first-run model download from actual transcription.
-  const status = payload.status ? `${payload.status} ` : '';
-  dom.progressLabel.textContent = `${status}${Math.round(pct)}%`;
+  //
+  // A status that already carries its own percentage does not get a second one
+  // appended. That is how the label came to read "Downloading model: 54% 24%",
+  // two different files' numbers sitting next to each other.
+  const status = payload.status || '';
+  dom.progressLabel.textContent = /\d\s*%/.test(status)
+    ? status
+    : `${status ? `${status} ` : ''}${Math.round(pct)}%`;
 }
 
 

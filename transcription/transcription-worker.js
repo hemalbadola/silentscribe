@@ -237,6 +237,9 @@ async function loadModel(modelId = DEFAULT_MODEL_ID) {
     configureOnnxRuntime(envConfig);
   }
 
+  // Per-file byte counters for this load.
+  const downloadedFiles = new Map();
+
   try {
     // Create the ASR pipeline with progress callback
     whisperPipeline = await pipelineFn(
@@ -244,19 +247,28 @@ async function loadModel(modelId = DEFAULT_MODEL_ID) {
       modelId,
       {
         progress_callback: (progressData) => {
-          // progressData can be: { status, name, file, progress, loaded, total }
-          if (progressData.status === 'progress' && progressData.progress != null) {
-            // Map download progress (0-100) to our progress range (0.05-0.4)
-            const downloadProgress = 0.05 + (progressData.progress / 100) * 0.35;
-            postProgress(downloadProgress, `Downloading model: ${Math.round(progressData.progress)}%`);
-          } else if (progressData.status === 'done') {
-            postProgress(0.4, 'Model loaded');
-          } else if (progressData.status === 'initiate') {
-            postProgress(0.05, `Loading: ${progressData.file || 'model files'}...`);
-          }
+          // progressData is { status, name, file, progress, loaded, total } and
+          // arrives PER FILE. Whisper is several files, so reporting whichever
+          // one spoke last showed two different downloads' numbers side by side
+          // ("54% 24%") and sent the bar backwards every time a new file began.
+          // 'done' also fires per file, which used to jump the bar to 40% while
+          // most of the model was still downloading.
+          //
+          // Summing bytes across every file seen so far gives one honest number.
+          const fraction = aggregateDownload(downloadedFiles, progressData);
+          if (fraction === null) return;
+
+          // No percentage in the text: the panel appends its own, which is how
+          // one number became two.
+          postProgress(0.05 + fraction * 0.35, 'Downloading the speech model — first run only');
         },
       }
     );
+
+    // Reported here rather than from the progress callback: 'done' fires once
+    // per file, so announcing completion there claimed the model was ready
+    // while most of it was still downloading.
+    postProgress(0.4, 'Speech model ready');
 
     loadedModelId = modelId;
     console.log(`[Transcription Worker] Whisper pipeline loaded successfully (${modelId})`);
@@ -480,6 +492,51 @@ self.onmessage = async function handleWorkerMessage(event) {
 // ============================================================================
 // PROGRESS & ERROR HELPERS
 // ============================================================================
+
+/**
+ * Fold one per-file progress event into an overall download fraction.
+ *
+ * Transformers.js reports progress PER FILE, and Whisper is several files. The
+ * old code reported whichever file spoke last, so the label showed two
+ * different downloads' numbers at once ("54% 24%") and the bar jumped backwards
+ * whenever a new file began. Its `done` event fires per file too, which used to
+ * announce the model as ready while most of it was still downloading.
+ *
+ * Summing bytes across every file seen so far gives one honest number.
+ *
+ * @param {Map<string, {loaded: number, total: number}>} files - Accumulator, mutated.
+ * @param {{status: string, file?: string, loaded?: number, total?: number}} event
+ * @returns {number|null} Fraction 0–0.99, or null when there is nothing to report.
+ */
+export function aggregateDownload(files, event) {
+  const { status, file, loaded, total } = event || {};
+  if (!file) return null;
+
+  if (status === 'initiate' || status === 'progress') {
+    files.set(file, { loaded: loaded || 0, total: total || 0 });
+  } else if (status === 'done') {
+    // A finished file counts as fully loaded even when no size was reported.
+    const seen = files.get(file);
+    const size = seen?.total || seen?.loaded || 0;
+    files.set(file, { loaded: size, total: size });
+  } else {
+    return null;
+  }
+
+  let loadedBytes = 0;
+  let totalBytes = 0;
+  for (const entry of files.values()) {
+    loadedBytes += entry.loaded;
+    totalBytes += entry.total;
+  }
+  if (totalBytes <= 0) return null;
+
+  // Capped below 1: files are discovered as they start, so the first one to
+  // finish would otherwise read as the whole model being ready. Completion is
+  // announced once, after the pipeline resolves.
+  return Math.min(0.99, loadedBytes / totalBytes);
+}
+
 
 /**
  * Post a progress update to the offscreen document.

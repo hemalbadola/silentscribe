@@ -1,7 +1,7 @@
 {
-  "version": "1.3.0",
+  "version": "1.3.1",
   "downloadUrl": "https://github.com/hemalbadola/silentscribe/releases/latest",
-  "notes": "Adds a right-click Start recording entry and a source picker, so recording no longer depends on a keyboard shortcut your browser may refuse to assign.",
+  "notes": "The model download progress now shows one honest number instead of two files fighting over the label.",
   "message": "",
   "llm": {
     "provider": "nvidia",
