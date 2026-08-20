@@ -386,6 +386,7 @@ function cacheDomReferences() {
 
   // Settings
   dom.btnRecord       = document.getElementById('btn-record');
+  dom.recordHint      = document.getElementById('record-hint');
   dom.btnSettingsOpen  = document.getElementById('btn-settings-open');
   dom.btnSettingsClose = document.getElementById('btn-settings-close');
   dom.settingsRadios   = document.querySelectorAll('input[name="model-size"]');
@@ -924,7 +925,7 @@ function handleSkipPermission() {
  *
  * @returns {void}
  */
-function handleStartRecording() {
+async function handleStartRecording() {
   const micEnabled = dom.toggleMic ? dom.toggleMic.checked : true;
   console.log(LOG_PREFIX, `Start recording requested (mic: ${micEnabled ? 'on' : 'off'})`);
 
@@ -932,14 +933,64 @@ function handleStartRecording() {
   // second click cannot open a second capture over the first.
   if (dom.btnRecord) dom.btnRecord.disabled = true;
 
-  sendMessage(MSG.UI_START_RECORDING, { micEnabled });
+  try {
+    const result = await chrome.runtime.sendMessage({
+      type: MSG.UI_START_RECORDING,
+      payload: { micEnabled, source: 'panel' },
+    });
 
-  // Re-arm if we are still sitting on the ready view shortly after. A
-  // successful start replaces this view, so this only fires when nothing
-  // happened — which must not leave the button permanently dead.
-  setTimeout(() => {
+    // Chrome accepts only four gestures as invoking an extension: the action,
+    // a context menu item, a commands-API shortcut, and an omnibox suggestion.
+    // A button in the side panel is none of them, so this panel can never grant
+    // activeTab and tab capture from here always needs the picker instead.
+    if (result?.needsPicker) {
+      await startWithPicker(micEnabled);
+    }
+  } catch (err) {
+    console.warn(LOG_PREFIX, 'Start request failed:', err.message);
+  } finally {
     if (dom.btnRecord) dom.btnRecord.disabled = false;
-  }, 3000);
+  }
+}
+
+
+/**
+ * Ask Chrome which tab or window to record, then start with that stream.
+ *
+ * chrome.desktopCapture needs no activeTab grant — the user picking a source in
+ * Chrome's own dialog IS the permission. It is the only route to a recording
+ * that works from the side panel.
+ *
+ * @param {boolean} micEnabled - Whether to record the microphone too.
+ * @returns {Promise<void>}
+ */
+async function startWithPicker(micEnabled) {
+  const streamId = await new Promise((resolve) => {
+    try {
+      chrome.desktopCapture.chooseDesktopMedia(
+        ['tab', 'audio', 'window', 'screen'],
+        (id) => resolve(id || null),
+      );
+    } catch (err) {
+      console.warn(LOG_PREFIX, 'Could not open the picker:', err.message);
+      resolve(null);
+    }
+  });
+
+  if (!streamId) {
+    // Cancelling is a choice, not a failure. Say so where the button is,
+    // rather than throwing up the full error screen.
+    console.log(LOG_PREFIX, 'Source picker dismissed');
+    if (dom.recordHint) {
+      dom.recordHint.textContent = 'No source chosen. Press Start Recording and pick the meeting tab, '
+        + 'or right-click the page and choose SilentScribe.';
+      dom.recordHint.hidden = false;
+    }
+    return;
+  }
+
+  if (dom.recordHint) dom.recordHint.hidden = true;
+  sendMessage(MSG.UI_START_RECORDING_WITH_STREAM, { streamId, micEnabled, mode: 'tab-video' });
 }
 
 

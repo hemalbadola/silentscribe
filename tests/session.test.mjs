@@ -166,6 +166,7 @@ check('and it loads the recordings list instead', /loadSessionList\(\)/.test(ini
 // extension claimed the keys. Those users had an extension that did nothing.
 console.log('\n[the extension can be started]');
 const html = readFileSync(join(ROOT, 'sidepanel/panel.html'), 'utf8');
+const require_manifest_json = readFileSync(join(ROOT, 'manifest.json'), 'utf8');
 check('the ready view has a record button', /id="btn-record"/.test(html));
 check('it sits in the ready view, above the recordings list',
       html.indexOf('id="btn-record"') > html.indexOf('id="view-ready"') &&
@@ -188,24 +189,38 @@ check('a metadata-only broadcast does not re-render',
 // session threw "Invalid state transition: COMPLETE -> RECORDING" — dead button
 // and dead shortcut after a single use.
 console.log('\n[a second recording]');
-const start = sw.slice(sw.indexOf('async function handleStartRecording('));
+// Whole function bodies, not fixed character windows. Three assertions in this
+// file have silently pointed at the wrong code because a comment grew and
+// pushed the line they were checking outside an arbitrary slice.
+const fnBody = (src, signature) => {
+  const i = src.indexOf(signature);
+  if (i < 0) return '';
+  const end = src.indexOf('\n}\n', i);
+  return src.slice(i, end < 0 ? src.length : end + 3);
+};
+
+const start = fnBody(sw, 'async function handleStartRecording(payload)');
 check('handleStartRecording normalises COMPLETE before recording',
       /COMPLETE[\s\S]{0,200}setState\(STATES\.READY\)/.test(start.slice(0, 1200)), 'no normalisation');
 check('and normalises ERROR too', /STATES\.ERROR[\s\S]{0,200}setState\(STATES\.READY\)/.test(start.slice(0, 1200)));
 
 // ── A failed start must never be silent ─────────────────────────────────────
 console.log('\n[failed starts are reported]');
-const startCatch = start.slice(start.indexOf('} catch'), start.indexOf('} catch') + 1400);
-check('a failed start always sets ERROR', /setState\(STATES\.ERROR/.test(startCatch));
-check('with no exception for the activeTab error',
-      !/panelWillRetry/.test(startCatch), 'the swallow is back');
+const startCatch = start.slice(start.indexOf('} catch'));
+check('a failed start sets ERROR', /setState\(STATES\.ERROR/.test(startCatch));
+// The one exception is the panel, which cannot grant activeTab at all and
+// retries with Chrome's picker. It must be told to retry, not shown an error.
+check('the panel is asked to use the picker instead of being shown an error',
+      /needsPicker: true/.test(startCatch), 'no picker handoff');
+check('and only the panel gets that exception',
+      /source === 'panel'/.test(startCatch), 'the exception is too broad');
 check('and it removes the empty session record', /deleteSession/.test(startCatch));
 
 // ── A stop that could not save must not report success ──────────────────────
 console.log('\n[a failed save is not hidden]');
-const stop = sw.slice(sw.indexOf('async function handleStopRecording('));
+const stop = fnBody(sw, 'async function handleStopRecording(payload)');
 check('the stop response is checked, not discarded',
-      /stopResponse[\s\S]{0,300}success === false/.test(stop.slice(0, 2500)), 'response ignored');
+      /stopResponse[\s\S]{0,300}success === false/.test(stop), 'response ignored');
 
 // ── Settings must be closable ───────────────────────────────────────────────
 // The close button used to call handleStateTransition, which ignores a state
@@ -232,13 +247,33 @@ check('the service worker checks the tab before capturing',
 // Scoped to the function body: a file-header comment mentions getMediaStreamId
 // hundreds of lines earlier, and matching that made this compare the wrong two
 // positions entirely.
-const startBody = sw.slice(sw.indexOf('async function handleStartRecording(payload)'));
 check('and it runs before getMediaStreamId',
-      startBody.indexOf('describeUncapturableTab(activeTab.url)') <
-        startBody.indexOf('chrome.tabCapture.getMediaStreamId'),
+      start.indexOf('describeUncapturableTab(activeTab.url)') <
+        start.indexOf('chrome.tabCapture.getMediaStreamId'),
       'the check runs too late to help');
 check('fire-and-forget handlers report their failures',
       /reportHandlerFailure/.test(sw), 'rejections still escape');
+
+// ── Entry points that can actually grant activeTab ──────────────────────────
+// Chrome accepts four gestures as invoking an extension: the action, a context
+// menu item, a commands-API shortcut, and an omnibox suggestion. A side panel
+// button is none of them, so the panel alone cannot start a tab capture.
+console.log('\n[ways in that actually work]');
+check('a context menu entry exists', /contextMenus\.create/.test(sw), 'no context menu');
+check('it toggles recording', /MENU_TOGGLE/.test(sw));
+check('contextMenus is permitted',
+      JSON.parse(require_manifest_json).permissions.includes('contextMenus'));
+check('the panel falls back to the source picker',
+      /chooseDesktopMedia/.test(panel), 'no picker fallback');
+check('and sends the stream it gets back',
+      /UI_START_RECORDING_WITH_STREAM/.test(panel), 'stream never forwarded');
+
+// A desktop stream id is not interchangeable with a tab one.
+const offscreen = readFileSync(join(ROOT, 'offscreen/offscreen.js'), 'utf8');
+check('the offscreen document honours the source type',
+      /chromeMediaSource: mediaSource/.test(offscreen), 'still hardcoded to tab');
+check('mapping desktop to the desktop source',
+      /sourceType === 'desktop' \? 'desktop' : 'tab'/.test(offscreen));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

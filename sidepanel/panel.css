@@ -440,6 +440,17 @@ p { color: var(--text-secondary); }
   color: var(--text-secondary);
 }
 
+/* Shown only when the source picker is dismissed, so the button never looks
+   like it did nothing. */
+.record-hint {
+  max-width: 22rem;
+  margin: 0.5rem auto 0;
+  font-size: var(--font-xs);
+  line-height: 1.5;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+
 .hotkey-hint {
   display: inline-block;
   font-size: var(--font-xs);

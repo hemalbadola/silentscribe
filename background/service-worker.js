@@ -95,6 +95,7 @@ let stopInProgress = false;
  * @param {chrome.runtime.InstalledDetails} details - Install event details.
  */
 chrome.runtime.onInstalled.addListener(async (details) => {
+  installContextMenu();
   scheduleConfigRefresh().catch((err) =>
     console.warn('[SilentScribe SW] Config refresh failed:', err));
   console.log(`[SilentScribe SW] Installed — reason: ${details.reason}`);
@@ -128,6 +129,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
  * on browser restart. The side panel will re-check permissions on open.
  */
 chrome.runtime.onStartup.addListener(async () => {
+  installContextMenu();
   scheduleConfigRefresh().catch((err) =>
     console.warn('[SilentScribe SW] Config refresh failed:', err));
   console.log('[SilentScribe SW] Browser startup — resetting state');
@@ -442,10 +444,22 @@ async function handleStartRecording(payload) {
     // about — press the shortcut, or the button, and get nothing at all.
     const isActiveTabError = err.message.includes('Extension has not been invoked');
 
+    // A click inside the side panel is not one of the four gestures Chrome
+    // accepts as invoking an extension (action, context menu, commands-API
+    // shortcut, omnibox), so the panel can never grant activeTab and tab
+    // capture from its button always lands here. That is not an error the user
+    // can act on — it is our cue to offer Chrome's own picker instead, which
+    // needs no such permission. The panel retries; do not send it to the error
+    // screen first.
+    if (isActiveTabError && payload?.source === 'panel') {
+      console.log('[SilentScribe SW] activeTab not granted from the panel — asking it to use the picker');
+      return { success: false, error: err.message, needsPicker: true };
+    }
+
     await setState(STATES.ERROR, {
       // The raw activeTab string names a permission, not an action.
       error: isActiveTabError
-        ? 'Chrome will not let SilentScribe capture this tab yet. Click the SilentScribe icon on the tab once, then start the recording again.'
+        ? 'Chrome will not let SilentScribe capture this tab yet. Use the right-click menu on the page, or the keyboard shortcut, to start the recording.'
         : err.message || 'Failed to start recording',
     });
     updateBadge('error');
@@ -811,6 +825,62 @@ chrome.runtime.onConnect.addListener((port) => {
  * If RECORDING → stop recording.
  * All other states → ignored.
  */
+// ============================================================================
+// CONTEXT MENU
+// ============================================================================
+
+/** Menu item id for the record/stop toggle. */
+const MENU_TOGGLE = 'silentscribe-toggle-recording';
+
+/**
+ * Register the right-click entry.
+ *
+ * This exists because it is one of only four gestures Chrome accepts as
+ * "invoking" an extension, alongside the action, a commands-API shortcut and an
+ * omnibox suggestion. Clicking a button inside the side panel is NOT one of
+ * them, so the panel cannot grant activeTab and cannot, on its own, start a tab
+ * capture. The keyboard shortcut can, but a shortcut is not always assignable —
+ * browsers own the obvious combinations. Right-clicking the page always works.
+ *
+ * @returns {Promise<void>}
+ */
+async function installContextMenu() {
+  try {
+    await chrome.contextMenus.removeAll();
+    chrome.contextMenus.create({
+      id: MENU_TOGGLE,
+      title: 'Start or stop recording with SilentScribe',
+      contexts: ['page', 'video', 'audio', 'frame', 'selection'],
+    });
+  } catch (err) {
+    console.warn('[SilentScribe SW] Could not install the context menu:', err);
+  }
+}
+
+
+chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId !== MENU_TOGGLE) return;
+
+  try {
+    const state = await getState();
+
+    if (state.state === STATES.RECORDING) {
+      await handleStopRecording();
+      return;
+    }
+
+    // The click has just granted activeTab for this tab, which is the whole
+    // point of this entry point, so the capture can go ahead directly.
+    const started = await handleStartRecording({ micEnabled: state.micEnabled, source: 'menu' });
+    if (!started?.success) {
+      console.warn('[SilentScribe SW] Context menu start failed:', started?.error);
+    }
+  } catch (err) {
+    console.error('[SilentScribe SW] Context menu handler failed:', err);
+  }
+});
+
+
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== 'toggle-recording') return;
 

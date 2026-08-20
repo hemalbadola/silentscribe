@@ -389,16 +389,23 @@ async function beginCapture({ streamId, micEnabled, sessionId, sourceType }) {
     console.log('[SilentScribe Offscreen] AudioContext resumed from suspended state');
   }
 
+  // 'desktop' is not interchangeable with 'tab'. A stream id from
+  // chrome.desktopCapture only works with chromeMediaSource: 'desktop', and
+  // this was hardcoded to 'tab' while sourceType was destructured, logged and
+  // then ignored — so the picker fallback could never have worked, however it
+  // was wired.
+  const mediaSource = sourceType === 'desktop' ? 'desktop' : 'tab';
+
   const constraints = {
     audio: {
       mandatory: {
-        chromeMediaSource: 'tab',
+        chromeMediaSource: mediaSource,
         chromeMediaSourceId: streamId,
       },
     },
     video: {
       mandatory: {
-        chromeMediaSource: 'tab',
+        chromeMediaSource: mediaSource,
         chromeMediaSourceId: streamId,
       },
     }
