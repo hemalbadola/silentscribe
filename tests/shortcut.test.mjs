@@ -59,9 +59,14 @@ check('words mapped to mac glyphs', JSON.stringify(keys(card)) === '["⌥","⇧"
 console.log('\n[unbound]');
 shortcut = ''; platform = 'Win32';
 card = await run();
-check('alert styling applied', card.className.includes('shortcut-card-alert'), card.className);
-check('names the contested combo from the manifest', card.text.includes('Alt+Shift+R'), card.text.slice(0, 160));
-check('gives numbered steps', card.all((n) => n.tagName === 'li').length === 3);
+// Not an alert: with no suggested key in the manifest, having no shortcut is
+// the normal starting state, and the panel has a Start Recording button.
+check('is not styled as a failure', !card.className.includes('shortcut-card-alert'), card.className);
+check('explains that no combination is claimed',
+      /claims no combination/.test(card.text), card.text.slice(0, 160));
+check('warns that a browser-owned combination will not stick',
+      /will not stick/.test(card.text), card.text.slice(0, 200));
+check('gives numbered steps', card.all((n) => n.tagName === 'li').length === 4);
 check('uses the manifest description', card.text.includes('Start or stop recording the current meeting'));
 const openBtn = card.find((n) => n.textContent === 'Open shortcut settings');
 check('has the open button', !!openBtn);
@@ -82,6 +87,18 @@ shortcut = 'Alt+Shift+R';
 const c2 = new Node('div');
 await initShortcutSetup(c2); await initShortcutSetup(c2);
 check('double init renders exactly one card', c2.children.length === 1, String(c2.children.length));
+
+// ── The manifest must not suggest a key ─────────────────────────────────────
+// Alt+Shift+R is owned by browsers (it opened reading mode on two different
+// machines). A suggested key the browser owns cannot be granted, and re-adding
+// one brings back the shortcut that silently clears itself on every reload.
+console.log('\n[the manifest suggests nothing]');
+const command = JSON.parse(require_manifest).commands?.['toggle-recording'];
+check('the toggle-recording command still exists', Boolean(command));
+check('and suggests no key', command && !('suggested_key' in command),
+      JSON.stringify(command));
+check('but still describes itself for the shortcuts page',
+      Boolean(command?.description), JSON.stringify(command));
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -2,7 +2,8 @@
  * SilentScribe — Keyboard Shortcut Setup
  * ============================================================================
  *
- * `suggested_key` in the manifest is only a suggestion. Chrome awards a key
+ * The manifest suggests NO key, deliberately. `suggested_key` is only a
+ * suggestion: Chrome awards a key
  * combination to the first extension that claims it, so where another
  * extension already owns ours, `chrome.commands.getAll()` reports an empty
  * `shortcut` and the keys trigger that other extension. The single fix is
@@ -106,26 +107,31 @@ function boundCard(shortcut) {
 
 /** Card for an unbound command. `available` is false if chrome.commands failed. */
 function unboundCard(available) {
-  const { suggested, description } = readManifestCommand();
-  const card = el('div', 'card glass-card shortcut-card shortcut-card-alert');
+  const { description } = readManifestCommand();
+  // Not an alert. Having no shortcut is the normal starting state now that the
+  // manifest suggests none, and the panel has a Start Recording button, so
+  // this is an optional extra rather than something that went wrong.
+  const card = el('div', 'card glass-card shortcut-card');
 
   const head = el('div', 'shortcut-head');
   head.append(
     el('span', 'card-icon-small', '⌨️'),
-    el('h3', 'shortcut-title', 'No shortcut assigned'),
+    el('h3', 'shortcut-title', 'Add a keyboard shortcut'),
   );
   head.firstChild.setAttribute('aria-hidden', 'true');
 
   const lead = !available
-    ? 'Chrome did not report a shortcut for SilentScribe. Assign one to record from the keyboard.'
-    : `Another extension already owns ${suggested || 'the default combination'}. `
-      + 'Chrome gives a combination to the first extension that claims it.';
+    ? 'Chrome did not report a shortcut for SilentScribe. You can still assign one.'
+    : 'SilentScribe claims no combination of its own, because the obvious ones are '
+      + 'already taken by browsers and other extensions — and a shortcut the browser '
+      + 'owns will not stick, however many times you set it. Choose one that is free.';
 
   const steps = el('ol', 'shortcut-steps');
   for (const text of [
     'Find SilentScribe in the list.',
     `Click the box next to "${description}".`,
     'Press the keys you want to use.',
+    'If it is blank again after a reload, the browser owns that combination. Pick another.',
   ]) {
     steps.append(el('li', null, text));
   }

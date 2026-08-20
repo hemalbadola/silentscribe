@@ -1,7 +1,7 @@
 {
-  "version": "1.2.0",
+  "version": "1.2.1",
   "downloadUrl": "https://github.com/hemalbadola/silentscribe/releases/latest",
-  "notes": "Restores the Record button and fixes the keyboard shortcut, which stopped responding after one recording. Past Recordings now show their real title, platform and duration.",
+  "notes": "Fixes the Settings close button, and stops the keyboard shortcut clearing itself on every reload.",
   "message": "",
   "llm": {
     "provider": "nvidia",

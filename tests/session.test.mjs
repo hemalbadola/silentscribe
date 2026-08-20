@@ -207,5 +207,23 @@ const stop = sw.slice(sw.indexOf('async function handleStopRecording('));
 check('the stop response is checked, not discarded',
       /stopResponse[\s\S]{0,300}success === false/.test(stop.slice(0, 2500)), 'response ignored');
 
+// ── Settings must be closable ───────────────────────────────────────────────
+// The close button used to call handleStateTransition, which ignores a state
+// it is already showing. With the panel on READY underneath, closing Settings
+// did nothing whatsoever.
+console.log('\n[settings closes]');
+// Comments stripped first: the handler's own comment explains why it does NOT
+// call handleStateTransition, and matching that made this assertion fail.
+const panelCode = panel.replace(/\/\*[\s\S]*?\*\//g, '').split('\n')
+  .map((l) => (/^\s*(\/\/|\*)/.test(l) ? '' : l)).join('\n');
+check('closing settings does not go through handleStateTransition',
+      !/btnSettingsClose\?\.addEventListener[\s\S]{0,400}handleStateTransition/.test(panelCode),
+      'still routed through it');
+check('it restores the view settings covered',
+      /btnSettingsClose[\s\S]{0,400}viewBeforeSettings/.test(panel));
+check('opening settings records what it covered',
+      /viewBeforeSettings = currentView/.test(panel));
+check('showView tracks the current view', /currentView = viewId/.test(panel));
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

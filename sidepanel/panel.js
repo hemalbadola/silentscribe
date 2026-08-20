@@ -88,6 +88,18 @@ let renderedState = null;
  */
 let viewingFromHistory = false;
 
+/**
+ * The view currently on screen, and the one Settings covered.
+ *
+ * Settings is an overlay, so closing it has to return to whatever was
+ * underneath. It used to do that by re-running handleStateTransition, which
+ * deliberately ignores a state it is already showing — so with the panel
+ * already on READY the close button did nothing at all.
+ * @type {string|null}
+ */
+let currentView = null;
+let viewBeforeSettings = null;
+
 
 const STATE_VIEW_MAP = {
   [STATES.IDLE]:               'view-onboarding',
@@ -509,6 +521,7 @@ function showView(viewId) {
     }
   });
 
+  currentView = viewId;
   console.log(LOG_PREFIX, 'View switched to:', viewId);
 }
 
@@ -632,14 +645,20 @@ function setupEventListeners() {
 
   // ── Settings View ──
   dom.btnSettingsOpen?.addEventListener('click', () => {
+    viewBeforeSettings = currentView;
     showView('view-settings');
   });
 
   dom.btnSettingsClose?.addEventListener('click', () => {
-    // Return to the normal view based on the current extension state
-    getState().then((state) => {
-      handleStateTransition(state);
-    }).catch(() => showView('view-error'));
+    // Go back to whatever Settings covered. Deliberately not routed through
+    // handleStateTransition: that ignores a state already on screen, which is
+    // correct for a broadcast and made this button dead.
+    const back = viewBeforeSettings && viewBeforeSettings !== 'view-settings'
+      ? viewBeforeSettings
+      : 'view-ready';
+    viewBeforeSettings = null;
+    if (back === 'view-ready') loadSessionList();
+    showView(back);
   });
 
   dom.settingsRadios?.forEach(radio => {
