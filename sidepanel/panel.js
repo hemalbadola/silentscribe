@@ -668,6 +668,13 @@ function setupEventListeners() {
   dom.btnSettingsOpen?.addEventListener('click', () => {
     viewBeforeSettings = currentView;
     showView('view-settings');
+
+    // Re-read on every open. The form was filled once when the panel loaded, so
+    // a key saved in another window — or one whose first load lost the race —
+    // showed as an empty box, which reads as "my key was forgotten".
+    getLlmConfig()
+      .then(renderLlmSettings)
+      .catch((err) => console.error(LOG_PREFIX, 'Could not load provider settings:', err));
   });
 
   dom.btnSettingsClose?.addEventListener('click', () => {
@@ -2826,18 +2833,54 @@ function setupLlmSettings() {
 function bindLlmField(input, toPatch) {
   let debounceId = null;
 
+  const commit = () => {
+    clearTimeout(debounceId);
+    debounceId = null;
+
+    // Only a field the user actually typed in may write. Blur used to save
+    // unconditionally, so clicking into the key box and clicking away wrote an
+    // empty key over a saved one — and if the settings had not finished loading
+    // yet, the box was empty through no fault of the user. A stored key must
+    // never be destroyed by a click.
+    if (!input.dataset.edited) return;
+
+    delete input.dataset.edited;
+    return setLlmConfig(toPatch(input.value));
+  };
+
   input.addEventListener('input', () => {
+    input.dataset.edited = 'yes';
     clearTimeout(debounceId);
     clearTestResult();
-    debounceId = setTimeout(() => setLlmConfig(toPatch(input.value)), 400);
+    debounceId = setTimeout(commit, 400);
   });
 
   // Blur commits immediately, so closing Settings never loses the last keystroke.
-  input.addEventListener('blur', () => {
-    clearTimeout(debounceId);
-    setLlmConfig(toPatch(input.value));
+  input.addEventListener('blur', commit);
+
+  // The side panel is torn down when it closes, taking any pending timer with
+  // it. Typing a key and closing the panel inside the debounce window lost the
+  // key entirely.
+  pendingLlmCommits.add(commit);
+}
+
+
+/**
+ * Field writers waiting to be flushed before this document goes away.
+ * @type {Set<() => (Promise<Object>|undefined)>}
+ */
+const pendingLlmCommits = new Set();
+
+for (const event of ['pagehide', 'blur']) {
+  window.addEventListener(event, () => {
+    for (const commit of pendingLlmCommits) commit();
   });
 }
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'hidden') return;
+  for (const commit of pendingLlmCommits) commit();
+});
 
 
 /**
@@ -2849,11 +2892,18 @@ function bindLlmField(input, toPatch) {
 function renderLlmSettings(config) {
   const preset = PROVIDERS[config.provider] || PROVIDERS.custom;
 
-  dom.llmProvider.value = config.provider;
-  dom.llmFormat.value   = config.format;
-  dom.llmBaseUrl.value  = config.baseUrl;
-  dom.llmApiKey.value   = config.apiKey;
-  dom.llmModel.value    = config.model;
+  // A missing field must render as empty, not as the string "undefined" — which
+  // then gets saved back as if the user had typed it.
+  dom.llmProvider.value = config.provider || 'builtin';
+  dom.llmFormat.value   = config.format || '';
+  dom.llmBaseUrl.value  = config.baseUrl || '';
+  dom.llmApiKey.value   = config.apiKey || '';
+  dom.llmModel.value    = config.model || '';
+
+  // Freshly rendered means "matches storage", so nothing here is unsaved.
+  for (const field of [dom.llmBaseUrl, dom.llmApiKey, dom.llmModel]) {
+    if (field) delete field.dataset.edited;
+  }
 
   // The on-device engine needs no URL, key, or model.
   dom.llmByokFields.hidden = config.provider === 'builtin';

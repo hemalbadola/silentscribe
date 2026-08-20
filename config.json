@@ -1,7 +1,7 @@
 {
-  "version": "1.4.0",
+  "version": "1.4.1",
   "downloadUrl": "https://github.com/hemalbadola/silentscribe/releases/latest",
-  "notes": "Recordings now open in a tab for fullscreen, download reliably, save as MP4 where the browser supports it, and show a working timeline.",
+  "notes": "Your API key can no longer be wiped by clicking through Settings, and the form always shows what is actually saved.",
   "message": "",
   "llm": {
     "provider": "nvidia",

@@ -1,5 +1,6 @@
 // Drives the real modules with chrome.* and fetch stubbed, so the request
 // shapes, retry logic, and map-reduce path are actually executed.
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -190,6 +191,63 @@ const explicit = { ...(await readConfig()), provider: 'openai', format: 'openai'
                    baseUrl: 'https://api.openai.com/v1', model: 'm', apiKey: 'sk-explicit-000000' };
 try { await chat({ system: 'S', user: 'U', config: explicit }); check('explicit config throws', false); }
 catch { check('an explicitly passed config never falls back', calls.length === 1, `calls=${calls.length}`); }
+
+// ── The key must survive ────────────────────────────────────────────────────
+// Reported as "the keys need to be saved — reloads shouldn't forget them".
+console.log('\n[the key persists]');
+store = {};
+await setLlmConfig({ provider: 'openai' });
+await setLlmConfig({ apiKey: 'sk-test-abcdefghijklmnop', model: 'gpt-4o-mini' });
+
+check('the key is written to storage',
+      JSON.stringify(store).includes('sk-test-abcdefghijklmnop'), JSON.stringify(store).slice(0, 120));
+check('it is in chrome.storage.local, which survives a reload',
+      Object.keys(store).length > 0 && !JSON.stringify(store).includes('session'));
+
+let savedCfg = await getLlmConfig();
+check('reading it back returns the key', savedCfg.apiKey === 'sk-test-abcdefghijklmnop', savedCfg.apiKey);
+check('and the model with it', savedCfg.model === 'gpt-4o-mini', savedCfg.model);
+
+// A reload re-reads storage; nothing else changes, so the same read must hold.
+savedCfg = await getLlmConfig();
+check('a second read is identical', savedCfg.apiKey === 'sk-test-abcdefghijklmnop');
+
+// ── Concurrent writes must not clobber each other ───────────────────────────
+console.log('\n[two settings saved at once]');
+store = {};
+await setLlmConfig({ provider: 'openai' });
+await Promise.all([
+  setLlmConfig({ apiKey: 'sk-concurrent-key-value' }),
+  setLlmConfig({ model: 'gpt-4o' }),
+  setLlmConfig({ baseUrl: 'https://example.test/v1' }),
+]);
+savedCfg = await getLlmConfig();
+check('the key survived', savedCfg.apiKey === 'sk-concurrent-key-value', savedCfg.apiKey);
+check('so did the model', savedCfg.model === 'gpt-4o', savedCfg.model);
+check('and the base URL', savedCfg.baseUrl === 'https://example.test/v1', savedCfg.baseUrl);
+
+// ── Changing provider deliberately clears the key ───────────────────────────
+console.log('\n[switching provider]');
+await setLlmConfig({ provider: 'anthropic' });
+savedCfg = await getLlmConfig();
+check('a new provider starts without the old key', !savedCfg.apiKey, savedCfg.apiKey);
+check('and picks up its own defaults', savedCfg.provider === 'anthropic', savedCfg.provider);
+
+// ── Nothing may quietly wipe a saved key ────────────────────────────────────
+// A blur on an empty field used to write apiKey: '' over a stored key, and the
+// field is empty whenever the form has not been filled in yet.
+console.log('\n[a click cannot destroy a key]');
+const panel = readFileSync(join(ROOT, 'sidepanel/panel.js'), 'utf8');
+check('a field only saves once the user has typed in it',
+      /if \(!input\.dataset\.edited\) return;/.test(panel), 'blur still writes unconditionally');
+check('rendering marks fields as matching storage',
+      /delete field\.dataset\.edited/.test(panel));
+check('a missing value renders empty, not "undefined"',
+      /config\.apiKey \|\| ''/.test(panel));
+check('settings re-read storage every time they open',
+      /showView\('view-settings'\)[\s\S]{0,400}getLlmConfig\(\)/.test(panel), 'opened without reloading');
+check('a pending edit is flushed before the panel goes away',
+      /pagehide/.test(panel) && /pendingLlmCommits/.test(panel), 'debounced edit can be lost');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
