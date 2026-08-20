@@ -406,18 +406,46 @@ async function showOnboarding() {
 
     tour.hidden = false;
     basic.hidden = true;
-    await renderOnboarding(tour, {
-      onComplete: () => {
-        tour.hidden = true;
-        basic.hidden = false;
-      },
-    });
+    await renderOnboarding(tour, { onComplete: finishOnboarding });
   } catch (err) {
     // A tour that cannot render must never block setup.
     console.warn(LOG_PREFIX, 'Onboarding tour failed, showing the basic screen:', err);
     tour.hidden = true;
     basic.hidden = false;
   }
+}
+
+
+/**
+ * Leave onboarding for the ready view.
+ *
+ * Hiding the tour is not enough on its own: the panel only changes view when
+ * the service worker broadcasts a new state, so without UI_ONBOARDING_COMPLETE
+ * the last button appeared to do nothing at all. The tour has already explained
+ * what the microphone is for, so whatever Chrome says about it now is the
+ * user's answer, and either answer moves on.
+ *
+ * @returns {Promise<void>}
+ */
+async function finishOnboarding() {
+  let micEnabled = false;
+  try {
+    const status = await navigator.permissions.query({ name: 'microphone' });
+    micEnabled = status.state === 'granted';
+  } catch {
+    // Permissions API unavailable here; record without the microphone.
+  }
+
+  console.log(LOG_PREFIX, `Onboarding finished (microphone: ${micEnabled ? 'on' : 'off'})`);
+  sendMessage(MSG.UI_TOGGLE_MIC, { micEnabled });
+  sendMessage(MSG.UI_ONBOARDING_COMPLETE);
+
+  // Restore the plain card underneath, so a dropped message leaves a usable
+  // screen instead of an empty one.
+  const tour = document.getElementById('onboarding-tour');
+  const basic = document.getElementById('onboarding-basic');
+  if (tour) tour.hidden = true;
+  if (basic) basic.hidden = false;
 }
 
 
