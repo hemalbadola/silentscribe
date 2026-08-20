@@ -1,7 +1,7 @@
 {
   "version": "1.2.0",
   "downloadUrl": "https://github.com/hemalbadola/silentscribe/releases/latest",
-  "notes": "Fixes the onboarding finish button, which never advanced past the tour.",
+  "notes": "Restores the Record button and fixes the keyboard shortcut, which stopped responding after one recording. Past Recordings now show their real title, platform and duration.",
   "message": "",
   "llm": {
     "provider": "nvidia",
