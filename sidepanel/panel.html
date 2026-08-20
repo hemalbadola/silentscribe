@@ -87,6 +87,14 @@
         </label>
       </div>
 
+      <!-- Start recording. The keyboard shortcut used to be the only way in,
+           which left the extension unusable whenever the shortcut was
+           unbound or taken by another extension. -->
+      <button id="btn-record" class="btn-record" type="button" aria-label="Start recording this tab">
+        <span class="record-icon" aria-hidden="true"></span>
+      </button>
+      <p class="record-label">Start Recording</p>
+
       <!-- Recording shortcut — card is built by sidepanel/shortcut-setup.js -->
       <div id="shortcut-setup"></div>
 
@@ -96,7 +104,7 @@
         <div id="session-list" class="session-list">
           <!-- Populated dynamically by panel.js -->
           <p id="no-sessions-msg" class="empty-state" hidden>
-            No recordings yet. Start your first one above!
+            No recordings yet. Press Start Recording above.
           </p>
         </div>
       </div>

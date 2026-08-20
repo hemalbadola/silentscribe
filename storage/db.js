@@ -305,6 +305,22 @@ function normalizeSession(session) {
     normalized.aiInsights = normalized.aiSummary;
   }
 
+  // createSession stores platform and title under metadata, but every reader —
+  // the session cards, the title bar, the exports — asks for them flat. Only
+  // the AI naming path ever wrote them flat, so a recording it had not touched
+  // showed as "Unknown" with a generic title. Project rather than move: old
+  // records already carry flat values, and those are the newer write.
+  if (normalized.platform == null && normalized.metadata?.platform != null) {
+    normalized.platform = normalized.metadata.platform;
+  }
+  if (normalized.meetingTitle == null && normalized.metadata?.meetingTitle != null) {
+    normalized.meetingTitle = normalized.metadata.meetingTitle;
+  }
+
+  // A recording with no transcript is not "pending" — it is finished without
+  // one. Make the flag explicit so the badge does not depend on undefined.
+  normalized.transcribed = Boolean(normalized.transcribed);
+
   if (Array.isArray(normalized.bookmarks)) {
     // A single null entry used to throw here, which made the whole session
     // impossible to open. Drop unusable entries instead.
@@ -378,6 +394,8 @@ export async function updateSessionPlatform(sessionId, platform) {
   const session = await getSession(sessionId);
   if (!session) return;
   session.platform = platform;
+  // Keep the canonical copy in step, so the two cannot disagree later.
+  if (session.metadata) session.metadata.platform = platform;
   await withStore(STORES.SESSIONS, 'readwrite', (store) => store.put(session));
 }
 
@@ -397,6 +415,8 @@ export async function updateSessionMeetingTitle(sessionId, meetingTitle) {
   const session = await getSession(sessionId);
   if (!session) return;
   session.meetingTitle = meetingTitle;
+  // Keep the canonical copy in step, so the two cannot disagree later.
+  if (session.metadata) session.metadata.meetingTitle = meetingTitle;
   await withStore(STORES.SESSIONS, 'readwrite', (store) => store.put(session));
 }
 
@@ -408,7 +428,10 @@ export async function updateSessionMeetingTitle(sessionId, meetingTitle) {
  * @returns {Promise<Object[]>} Array of session records.
  */
 export async function getSessions(limit = 50) {
-  return queryAll(STORES.SESSIONS, 'byStartTime', null, 'prev', limit);
+  // getSession normalizes and this did not, so a recording looked correct when
+  // opened and wrong in the list it was opened from.
+  const sessions = await queryAll(STORES.SESSIONS, 'byStartTime', null, 'prev', limit);
+  return sessions.map(normalizeSession);
 }
 
 

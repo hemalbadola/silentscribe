@@ -16,7 +16,7 @@
  */
 
 import { MSG, UI_CONFIG } from '../utils/constants.js';
-import { STATES, getState, onStateChange } from '../utils/state.js';
+import { STATES, getState } from '../utils/state.js';
 import {
   getSessions,
   getSession,
@@ -71,6 +71,24 @@ const LIVE_TRANSCRIPT_MAX_SLICES = 40;
  *
  * @type {Object<string, string>}
  */
+/**
+ * The state name currently drawn on screen.
+ *
+ * Guards against re-rendering for a broadcast that only carried new metadata.
+ * @type {string|null}
+ */
+let renderedState = null;
+
+/**
+ * True while the user is watching a recording they opened from their history,
+ * rather than one they just made. A transcript finishing in the background
+ * broadcasts COMPLETE, and without this that broadcast swapped the video out
+ * from under them for a different recording entirely.
+ * @type {boolean}
+ */
+let viewingFromHistory = false;
+
+
 const STATE_VIEW_MAP = {
   [STATES.IDLE]:               'view-onboarding',
   [STATES.PERMISSIONS_NEEDED]: 'view-onboarding',
@@ -245,7 +263,22 @@ async function initialize() {
       }
     }
 
-    handleStateTransition(state);
+    // Opening the panel is not the same as finishing a recording. The state is
+    // kept for the whole browser session, so a panel reopened hours later used
+    // to land straight on the last recording's video with no way back to the
+    // list — and the shortcut was dead for the same reason, because nothing
+    // ever left COMPLETE. Start where the user can act: the recordings list.
+    if (state.state === STATES.COMPLETE || state.state === STATES.PROCESSING) {
+      console.log(LOG_PREFIX, `Opening on the recordings list rather than restoring ${state.state}`);
+      // Only COMPLETE is safe to clear. PROCESSING means a transcript is still
+      // being written, and that run owns the state until it finishes.
+      if (state.state === STATES.COMPLETE) sendMessage(MSG.UI_DISMISS_ERROR);
+      showView('view-ready');
+      loadSessionList();
+      syncMicToggle(state.micEnabled);
+    } else {
+      handleStateTransition(state);
+    }
   } catch (err) {
     console.error(LOG_PREFIX, 'Failed to read initial state:', err);
     showView('view-error');
@@ -256,8 +289,13 @@ async function initialize() {
     });
   }
 
-  // React to future state changes pushed from the service worker
-  onStateChange(handleStateTransition);
+  // Deliberately NOT also subscribing with onStateChange(). setState() and
+  // updateMetadata() each write chrome.storage.session AND broadcast
+  // STATE_CHANGED, so listening to both ran every transition twice — two view
+  // renders, two session-list loads, and for a finished recording two full
+  // reads out of OPFS with two object URLs, one of which leaked.
+  // setupMessageListener() handles STATE_CHANGED, which is the same protocol
+  // every other message in this panel uses.
 }
 
 
@@ -335,6 +373,7 @@ function cacheDomReferences() {
   dom.btnDismissError  = document.getElementById('btn-dismiss-error');
 
   // Settings
+  dom.btnRecord       = document.getElementById('btn-record');
   dom.btnSettingsOpen  = document.getElementById('btn-settings-open');
   dom.btnSettingsClose = document.getElementById('btn-settings-close');
   dom.settingsRadios   = document.querySelectorAll('input[name="model-size"]');
@@ -494,6 +533,30 @@ function handleStateTransition(stateObj) {
     return;
   }
 
+  // updateMetadata() broadcasts the same way setState() does, so an AI title
+  // landing, or a platform being detected, arrives here looking like a
+  // transition. Re-running the full switch on one of those rebuilt the view
+  // and reset activeSessionId — which threw the user out of whatever recording
+  // they had opened from their history, mid-watch. Only the light parts should
+  // follow a metadata change.
+  if (stateObj.state === renderedState) {
+    syncMicToggle(stateObj.micEnabled);
+    if (stateObj.state === STATES.RECORDING) showPlatformBadge(stateObj.platform);
+    return;
+  }
+
+  // A background transcript finishing must not replace the recording the user
+  // deliberately opened. A new recording starting still wins, because that is
+  // the user acting.
+  if (viewingFromHistory && (stateObj.state === STATES.COMPLETE || stateObj.state === STATES.PROCESSING)) {
+    console.log(LOG_PREFIX, `Staying on the opened recording despite a ${stateObj.state} broadcast`);
+    renderedState = stateObj.state;
+    return;
+  }
+
+  renderedState = stateObj.state;
+  viewingFromHistory = false;
+
   showView(viewId);
 
   switch (stateObj.state) {
@@ -558,6 +621,9 @@ function setupEventListeners() {
   // ── Onboarding ─────────────────────────────────────────────────────
   dom.btnGrantPermission.addEventListener('click', handleGrantPermission);
   dom.btnSkipPermission.addEventListener('click', handleSkipPermission);
+
+  // ── Ready View ──
+  dom.btnRecord?.addEventListener('click', handleStartRecording);
 
   // ── Error View ──
   dom.btnDismissError.addEventListener('click', () => {
@@ -630,7 +696,12 @@ function setupEventListeners() {
 
   // ── Complete ───────────────────────────────────────────────────────
   dom.btnNewRecording.addEventListener('click', handleNewRecording);
-  dom.btnBackComplete.addEventListener('click', () => showView('view-ready'));
+  dom.btnBackComplete.addEventListener('click', () => {
+    viewingFromHistory = false;
+    renderedState = STATES.READY;
+    loadSessionList();
+    showView('view-ready');
+  });
 
   // Sync transcript highlighting with video playback
   dom.mediaPlayer.addEventListener('timeupdate', () => {
@@ -826,9 +897,31 @@ function handleSkipPermission() {
  * Start recording. Reads the current mic toggle state and sends
  * UI_START_RECORDING to the service worker.
  *
+ * This was deleted once, on the reasoning that the UI no longer used it. The
+ * UI had no other way in: with the button gone the keyboard shortcut was the
+ * only route to a recording, and that shortcut is unbound on any machine where
+ * another extension claimed the same keys. The extension looked completely
+ * inert to those users.
+ *
  * @returns {void}
  */
-// Removed handleStartRecording entirely as it is no longer used by the UI
+function handleStartRecording() {
+  const micEnabled = dom.toggleMic ? dom.toggleMic.checked : true;
+  console.log(LOG_PREFIX, `Start recording requested (mic: ${micEnabled ? 'on' : 'off'})`);
+
+  // A start takes a moment to acquire the tab. Disable straight away so a
+  // second click cannot open a second capture over the first.
+  if (dom.btnRecord) dom.btnRecord.disabled = true;
+
+  sendMessage(MSG.UI_START_RECORDING, { micEnabled });
+
+  // Re-arm if we are still sitting on the ready view shortly after. A
+  // successful start replaces this view, so this only fires when nothing
+  // happened — which must not leave the button permanently dead.
+  setTimeout(() => {
+    if (dom.btnRecord) dom.btnRecord.disabled = false;
+  }, 3000);
+}
 
 
 /**
@@ -1670,15 +1763,28 @@ async function handleViewSession(sessionId) {
   try {
     const session = await getSession(sessionId);
     if (!session) {
-      console.warn(LOG_PREFIX, 'Session not found:', sessionId);
+      // Clicking a card and getting nothing at all is the worst outcome here.
+      showView('view-error');
+      showError(null, {
+        title: 'That recording could not be opened',
+        cause: 'Its entry is in the list, but the recording itself is no longer stored.',
+        action: 'Delete it from the list with the ✕ button. Other recordings are unaffected.',
+      });
       return;
     }
 
     // Populate the complete view and switch to it
     await populateCompleteView(session);
+    viewingFromHistory = true;
+    renderedState = STATES.COMPLETE;
     showView('view-complete');
   } catch (err) {
     console.error(LOG_PREFIX, 'Failed to load session:', sessionId, err);
+    showView('view-error');
+    showError(err, {
+      title: 'That recording could not be opened',
+      action: 'Try another recording. If none open, run Diagnostics in Settings.',
+    });
   }
 }
 
@@ -2357,9 +2463,16 @@ function triggerDownload(blob, filename) {
  * @returns {void}
  */
 function showError(error, override) {
-  const explained = override
-    ? { raw: '', known: true, ...override }
-    : explainError(error || 'An unexpected error occurred.');
+  // An override refines the explanation rather than replacing it. It used to
+  // replace it outright, which threw away the real message whenever a caller
+  // wanted a better title, and printed "undefined" for any field the override
+  // happened not to set.
+  const base = error
+    ? explainError(error)
+    : { title: 'Something went wrong', cause: '', action: '', raw: '', known: true };
+
+  const explained = { ...base, ...override };
+  if (!explained.cause) explained.cause = base.raw || 'No details were reported.';
 
   if (dom.errorTitle) dom.errorTitle.textContent = explained.title;
   if (dom.errorMessage) dom.errorMessage.textContent = explained.cause;

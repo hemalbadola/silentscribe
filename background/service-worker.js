@@ -24,9 +24,10 @@
  */
 
 import { STATES, getState, setState, updateMetadata } from '../utils/state.js';
-import { MSG, OFFSCREEN_CONFIG, SESSION_STATUS } from '../utils/constants.js';
+import { MSG, OFFSCREEN_CONFIG, SESSION_STATUS, WHISPER_CONFIG } from '../utils/constants.js';
 import {
   createSession,
+  deleteSession,
   finalizeSession,
   updateSessionStatus,
   saveTranscript,
@@ -52,6 +53,33 @@ import { cleanupTranscript } from '../utils/ai.js';
  * @type {chrome.runtime.Port|null}
  */
 let keepalivePort = null;
+
+
+/**
+ * True while the offscreen document is still transcribing.
+ *
+ * Transcription runs in the BACKGROUND now, so the extension state is COMPLETE
+ * (or PROCESSING) while the document is still working. State alone therefore
+ * cannot say whether the document is busy, and closeOffscreenDocument used to
+ * destroy a running transcription with no error at all.
+ *
+ * @type {boolean}
+ */
+let transcriptionInFlight = false;
+
+
+/**
+ * True while a stop is already running.
+ *
+ * The panel disables both Stop buttons, but re-enables them milliseconds later,
+ * so a double click sends two UI_STOP_RECORDING messages. Both used to read
+ * RECORDING before either wrote COMPLETE, which stopped the same session twice
+ * and started two transcriptions of it. This flag is set before the first
+ * await, so the second message cannot get past it.
+ *
+ * @type {boolean}
+ */
+let stopInProgress = false;
 
 
 // ============================================================================
@@ -196,10 +224,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Side panel listens for this via chrome.runtime.onMessage
       return false;
 
+    case MSG.OFFSCREEN_GET_SETTINGS:
+      // The offscreen document cannot read chrome.storage — that API is not
+      // exposed to it at all. It asks here instead.
+      handleOffscreenGetSettings().then(sendResponse);
+      return true;
+
     // ── From Transcription Worker (via offscreen doc) ────────────
     case MSG.TRANSCRIPTION_PROGRESS:
       // Forwarded automatically since the offscreen doc sends via
-      // chrome.runtime.sendMessage which broadcasts to all contexts
+      // chrome.runtime.sendMessage which broadcasts to all contexts.
+      // Progress is also proof the document is still working: after a service
+      // worker restart the in-flight marker is gone, and this is the only
+      // signal left that stops closeOffscreenDocument killing the run.
+      transcriptionInFlight = true;
       return false;
 
     case MSG.TRANSCRIPTION_COMPLETE:
@@ -247,9 +285,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 async function handleStartRecording(payload) {
   console.log('[SilentScribe SW] Starting recording...', payload);
 
+  // Only READY may become RECORDING. Every finished recording leaves the
+  // extension in COMPLETE, and a failure leaves it in ERROR, so without this
+  // the second recording of a session threw "Invalid state transition:
+  // COMPLETE -> RECORDING" — the button and the shortcut both dead after one
+  // use. Normalising here covers every entry point rather than each caller
+  // remembering to do it.
+  const entryState = await getState();
+  if (entryState.state === STATES.COMPLETE || entryState.state === STATES.ERROR) {
+    await setState(STATES.READY);
+  }
+
+  // Declared out here so the catch can remove the record that step 1 writes.
+  let sessionId = null;
+
   try {
     // Step 1: Generate session ID and create session record in IndexedDB
-    const sessionId = generateSessionId();
+    sessionId = generateSessionId();
     const currentState = await getState();
 
     await createSession({
@@ -314,16 +366,34 @@ async function handleStartRecording(payload) {
 
   } catch (err) {
     console.error('[SilentScribe SW] Failed to start recording:', err);
-    
-    // If it's the expected tabCapture activeTab error, don't set the global ERROR state
-    // because the UI is going to automatically handle the fallback to desktopCapture.
-    if (!err.message.includes('Extension has not been invoked')) {
-      await setState(STATES.ERROR, {
-        error: err.message || 'Failed to start recording',
-      });
-      updateBadge('error');
+
+    // createSession writes the record as step 1, before any capture is tried,
+    // so a failed start used to leave a permanent empty entry in Past
+    // Recordings and a committed zero-byte OPFS file. The cleanup must not
+    // replace the real error, so its own failure is only logged.
+    if (sessionId) {
+      await deleteSession(sessionId).catch((cleanupErr) =>
+        console.warn('[SilentScribe SW] Could not remove the empty session:', cleanupErr));
     }
-    
+
+    // Every failed start is reported, from every entry point.
+    //
+    // This used to swallow the tabCapture activeTab error, on the reasoning
+    // that "the UI will fall back to desktopCapture". That fallback has never
+    // existed: UI_START_RECORDING_WITH_STREAM has a handler in this file and a
+    // name in constants.js, and nothing anywhere sends it. So the one failure
+    // the code recognised by name was the one failure nobody was ever told
+    // about — press the shortcut, or the button, and get nothing at all.
+    const isActiveTabError = err.message.includes('Extension has not been invoked');
+
+    await setState(STATES.ERROR, {
+      // The raw activeTab string names a permission, not an action.
+      error: isActiveTabError
+        ? 'Chrome will not let SilentScribe capture this tab yet. Click the SilentScribe icon on the tab once, then start the recording again.'
+        : err.message || 'Failed to start recording',
+    });
+    updateBadge('error');
+
     return { success: false, error: err.message };
   }
 }
@@ -338,8 +408,13 @@ async function handleStartRecording(payload) {
 async function handleStartRecordingWithStream(payload) {
   console.log('[SilentScribe SW] Starting recording with provided stream ID...', payload);
 
+  // Declared out here so the catch can remove the record createSession writes
+  // below, for the same reason as the tab path: a failed start must not leave
+  // an empty recording behind.
+  let sessionId = null;
+
   try {
-    const sessionId = generateSessionId();
+    sessionId = generateSessionId();
     const currentState = await getState();
 
     // If we were previously in ERROR state (due to tabCapture failing first),
@@ -386,6 +461,12 @@ async function handleStartRecordingWithStream(payload) {
     return { success: true };
   } catch (err) {
     console.error('[SilentScribe SW] Failed to start desktop recording:', err);
+
+    if (sessionId) {
+      await deleteSession(sessionId).catch((cleanupErr) =>
+        console.warn('[SilentScribe SW] Could not remove the empty session:', cleanupErr));
+    }
+
     await setState(STATES.ERROR, {
       error: err.message || 'Failed to start desktop recording',
     });
@@ -412,6 +493,16 @@ async function handleStopRecording(payload) {
   // Default to transcribing, so the keyboard shortcut and any older caller
   // that sends no payload keep the original behaviour.
   const transcribe = payload?.transcribe !== false;
+
+  // Checked before the first await: two stop messages arriving milliseconds
+  // apart both used to read RECORDING and run the whole stop, which finalized
+  // the session twice and started two transcriptions of it.
+  if (stopInProgress) {
+    console.warn('[SilentScribe SW] Ignoring a duplicate stop — one is already running');
+    return { success: false, error: 'Already stopping' };
+  }
+  stopInProgress = true;
+
   console.log(`[SilentScribe SW] Stopping recording (transcribe: ${transcribe})...`);
 
   try {
@@ -430,10 +521,19 @@ async function handleStopRecording(payload) {
 
     // Tell the offscreen document to stop capturing. It only starts
     // transcription when we ask it to.
-    await chrome.runtime.sendMessage({
+    //
+    // The answer matters: the offscreen document reports a stop that failed to
+    // flush its audio to disk. Ignoring it marked a recording COMPLETE and put
+    // a truncated or empty file on screen as though nothing had gone wrong,
+    // which is the one failure a recorder must never hide.
+    const stopResponse = await chrome.runtime.sendMessage({
       type: MSG.OFFSCREEN_STOP_CAPTURE,
       payload: { transcribe },
     });
+
+    if (stopResponse && stopResponse.success === false) {
+      throw new Error(stopResponse.error || 'The recording could not be saved.');
+    }
 
     // The recording is written and playable, so show it straight away. There is
     // no waiting screen: transcription, when asked for, runs behind the video
@@ -448,6 +548,12 @@ async function handleStopRecording(payload) {
       transcribingSessionId: transcribe ? state.sessionId : null,
     });
     updateBadge(transcribe ? 'processing' : 'complete');
+
+    // The offscreen document starts transcription by itself once capture ends.
+    // Record that, so closeOffscreenDocument cannot close the document while
+    // that run is going. Only set, never cleared here: a stop without
+    // transcription must not cancel a previous session still being transcribed.
+    if (transcribe) transcriptionInFlight = true;
 
     if (!transcribe) {
       await closeOffscreenDocument();
@@ -464,6 +570,10 @@ async function handleStopRecording(payload) {
     });
     updateBadge('error');
     return { success: false, error: err.message };
+
+  } finally {
+    // Released either way: a stop that failed must be retryable.
+    stopInProgress = false;
   }
 }
 
@@ -550,12 +660,22 @@ async function ensureOffscreenDocument() {
  * @returns {Promise<void>}
  */
 async function closeOffscreenDocument() {
-  // The offscreen document holds the live MediaRecorder. Now that transcription
-  // finishes in the background, a transcription that ends while a new recording
-  // is running must not close the document out from under it.
+  // The offscreen document holds the live MediaRecorder AND runs transcription.
+  // Now that transcription finishes in the background, a transcription that
+  // ends while a new recording is running must not close the document out from
+  // under it.
   const state = await getState();
   if (state.state === STATES.RECORDING) {
     console.log('[SilentScribe SW] Keeping the offscreen document — a recording is active');
+    return;
+  }
+
+  // Refusing only during RECORDING was not enough. Transcription runs after the
+  // recording is finished, so the state is COMPLETE or PROCESSING while the
+  // document is still transcribing, and closing it there destroyed the run
+  // silently — no transcript, no error, nothing.
+  if (transcriptionInFlight) {
+    console.log('[SilentScribe SW] Keeping the offscreen document — a transcription is still running');
     return;
   }
 
@@ -598,6 +718,11 @@ chrome.runtime.onConnect.addListener((port) => {
       console.log('[SilentScribe SW] Keepalive port disconnected');
       keepalivePort = null;
 
+      // The document that was doing the work is gone, so nothing is in flight.
+      // Without this the marker would stay true forever and the next offscreen
+      // document could never be closed.
+      transcriptionInFlight = false;
+
       // Check if we were recording when the port disconnected
       const state = await getState();
       if (state.state === STATES.RECORDING || state.state === STATES.PROCESSING) {
@@ -638,21 +763,33 @@ chrome.commands.onCommand.addListener(async (command) => {
   try {
     const state = await getState();
 
-    // Recover from ERROR state if user tries to use the hotkey to record again
-    if (state.state === STATES.ERROR) {
-      console.log('[SilentScribe SW] Recovering from ERROR state via hotkey');
+    // States the hotkey has to be able to leave. COMPLETE is the important one:
+    // it is where every finished recording lands and nothing left it on its own,
+    // so the shortcut worked exactly once and then appeared broken for the rest
+    // of the browser session. ERROR is the same dead end after a failure.
+    if (state.state === STATES.ERROR || state.state === STATES.COMPLETE) {
+      console.log(`[SilentScribe SW] Hotkey leaving ${state.state} to start a new recording`);
       await setState(STATES.READY);
-      // Re-fetch state to ensure clean start
     }
 
     const newState = await getState();
 
     if (newState.state === STATES.READY) {
-      await handleStartRecording({ micEnabled: newState.micEnabled });
+      // This listener discards the result, so a failed start has to make
+      // itself visible: handleStartRecording sets ERROR and the red badge for
+      // a hotkey start, and the title says why when the panel is closed.
+      const started = await handleStartRecording({ micEnabled: newState.micEnabled, source: 'hotkey' });
+      if (!started?.success) {
+        chrome.action.setTitle({ title: `SilentScribe — could not start: ${started?.error || 'unknown error'}` });
+      }
     } else if (newState.state === STATES.RECORDING) {
       await handleStopRecording();
     } else {
+      // Only IDLE, PERMISSIONS_NEEDED and PROCESSING reach here, and each has a
+      // real reason. Say it in the badge instead of only the console, so the
+      // key never just does nothing.
       console.log(`[SilentScribe SW] Hotkey ignored — current state: ${newState.state}`);
+      flashBadge(newState.state === STATES.PROCESSING ? 'busy' : 'setup');
     }
   } catch (err) {
     console.error('[SilentScribe SW] Hotkey handler failed:', err);
@@ -721,9 +858,11 @@ async function handleMeetingDetected(payload) {
   // Only update platform info if we're not currently recording
   // (don't change context mid-recording)
   if (state.state !== STATES.RECORDING && state.state !== STATES.PROCESSING) {
-    await chrome.storage.session.set({
-      silentscribe_state: { ...state, platform: payload.platform },
-    });
+    // Writing chrome.storage.session directly skipped the mutation queue in
+    // utils/state.js and broadcast nothing: a transition landing between the
+    // read above and this write was erased, and no context heard about the new
+    // platform. updateMetadata queues the read-modify-write and broadcasts.
+    await updateMetadata({ platform: payload.platform });
   }
 }
 
@@ -739,6 +878,34 @@ async function handleMeetingStateChanged(payload) {
   // For V1, we just log it
 }
 
+
+
+/**
+ * Read the settings the offscreen document needs, on its behalf.
+ *
+ * An offscreen document is given `chrome.runtime` and essentially nothing
+ * else — `chrome.storage` is undefined there, so reading a setting directly
+ * from that context throws `Cannot read properties of undefined`. Routing the
+ * read through here keeps one source of truth and means a setting changed
+ * mid-recording is still picked up when transcription starts.
+ *
+ * Never rejects: the offscreen document must be able to record whatever
+ * storage does, so a failure returns the same defaults as a missing key.
+ *
+ * @returns {Promise<{liveTranscript: boolean, modelSize: string}>}
+ */
+async function handleOffscreenGetSettings() {
+  try {
+    const stored = await chrome.storage.local.get(['liveTranscript', 'modelSize']);
+    return {
+      liveTranscript: Boolean(stored.liveTranscript),
+      modelSize: stored.modelSize || WHISPER_CONFIG.MODEL_ID,
+    };
+  } catch (err) {
+    console.warn('[SilentScribe SW] Could not read offscreen settings:', err.message);
+    return { liveTranscript: false, modelSize: WHISPER_CONFIG.MODEL_ID };
+  }
+}
 
 
 /**
@@ -770,6 +937,11 @@ async function handleCaptureComplete(payload) {
  */
 async function handleCaptureError(payload) {
   console.error(`[SilentScribe SW] Capture error: ${payload.error}`);
+
+  // Capture failed, so the transcription this stop expected will never run.
+  // Leaving the marker set would keep the offscreen document open forever.
+  transcriptionInFlight = false;
+
   await setState(STATES.ERROR, { error: payload.error });
   updateBadge('error');
 }
@@ -785,6 +957,10 @@ async function handleCaptureError(payload) {
  */
 async function handleTranscriptionComplete(payload) {
   console.log(`[SilentScribe SW] Transcription complete for session: ${payload.sessionId}`);
+
+  // The document reported it finished, so closeOffscreenDocument below is
+  // allowed to close it.
+  transcriptionInFlight = false;
 
   try {
     // Optional pass to fix stutters and mis-hearings. Off by default because it
@@ -828,6 +1004,9 @@ async function handleTranscriptionComplete(payload) {
  */
 async function handleTranscriptionError(payload) {
   console.error(`[SilentScribe SW] Transcription error: ${payload.error}`);
+
+  // The run is over, so the offscreen document may be closed at the end.
+  transcriptionInFlight = false;
 
   // A failed transcription must not take over the screen. The recording itself
   // is safe and playable, and this used to throw the user into the full-screen
@@ -885,22 +1064,42 @@ async function handleStartTranscription(payload) {
   try {
     // No state transition: the user stays on the recording they are watching.
     // Progress reaches the transcript tab through TRANSCRIPTION_PROGRESS.
-    await updateMetadata({ transcribingSessionId: payload.sessionId });
+    await updateMetadata({ transcribingSessionId: payload.sessionId, transcriptionError: null });
     updateBadge('processing');
+    transcriptionInFlight = true;
 
     await ensureOffscreenDocument();
 
-    await chrome.runtime.sendMessage({
-      type: MSG.UI_START_TRANSCRIPTION,
-      payload: { sessionId: payload.sessionId },
-    });
+    try {
+      await chrome.runtime.sendMessage({
+        type: MSG.UI_START_TRANSCRIPTION,
+        payload: { sessionId: payload.sessionId },
+      });
+    } catch (relayErr) {
+      // The offscreen handler for this message returns false and never calls
+      // sendResponse, so a delivered message can still settle as "The message
+      // port closed before a response was received". That messaging string was
+      // escalated to the full-screen ERROR view — on a transcription that had
+      // in fact started, and with nothing that ever transitioned back out.
+      if (!/message port closed/i.test(relayErr.message)) throw relayErr;
+      console.log('[SilentScribe SW] Transcription request delivered without a reply');
+    }
 
     return { success: true };
   } catch (err) {
     console.error('[SilentScribe SW] Failed to start transcription:', err);
-    await setState(STATES.ERROR, {
-      error: err.message || 'Failed to start transcription',
+
+    // A transcription that could not start is not a reason to take over the
+    // screen: the recording is safe and playable. Report it in place on the
+    // transcript tab, exactly like a transcription that fails later, and clear
+    // the marker so the tab does not sit on a spinner nothing ever leaves.
+    transcriptionInFlight = false;
+    await updateMetadata({
+      transcribingSessionId: null,
+      transcriptionError: 'Transcription could not be started. Try again.',
     });
+    updateBadge('idle');
+
     return { success: false, error: err.message };
   }
 }
@@ -1007,6 +1206,37 @@ async function handleExport(payload) {
  * 
  * @param {'recording'|'processing'|'complete'|'error'|'idle'} state - Badge state.
  */
+/**
+ * Show a short badge saying why the hotkey did nothing.
+ *
+ * A key that silently does nothing is the worst kind of broken: there is no
+ * error to read and nothing to search for. The badge is the only surface the
+ * shortcut has when the side panel is closed.
+ *
+ * @param {'busy'|'setup'} reason - Why the press was refused.
+ * @returns {void}
+ */
+function flashBadge(reason) {
+  const flashes = {
+    busy:  { text: '...', color: '#FFB300', title: 'SilentScribe — still finishing the last recording' },
+    setup: { text: '?',   color: '#FFB300', title: 'SilentScribe — open the side panel to finish setup' },
+  };
+  const flash = flashes[reason] || flashes.setup;
+
+  chrome.action.setBadgeText({ text: flash.text });
+  chrome.action.setBadgeBackgroundColor({ color: flash.color });
+  chrome.action.setTitle({ title: flash.title });
+
+  setTimeout(async () => {
+    try {
+      const { state } = await getState();
+      updateBadge(state === STATES.RECORDING ? 'recording' : 'idle');
+      chrome.action.setTitle({ title: 'SilentScribe — Open Side Panel' });
+    } catch { /* the worker went away; the badge resets with it */ }
+  }, 2500);
+}
+
+
 function updateBadge(state) {
   const badges = {
     recording:  { text: 'REC', color: '#E53935' },

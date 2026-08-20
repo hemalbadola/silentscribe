@@ -52,5 +52,33 @@ for (const [label, input] of [['null', null], ['undefined', undefined], ['empty 
   check(`${label} does not throw and yields a title`, typeof r.title === 'string' && r.title.length > 0);
 }
 
+// An internal fault must say so. The user who hit "Cannot read properties of
+// undefined (reading 'local')" got "Something went wrong" and a Try Again
+// button, which told them nothing and could not help.
+console.log('\n[a bug in our own code says so]');
+for (const raw of [
+  "Cannot read properties of undefined (reading 'local')",
+  'Capture start failed: TypeError: Cannot read properties of undefined',
+  'startLivePreview is not a function',
+  'WHISPER_CONFIG is not defined',
+]) {
+  const r = explainError(raw);
+  check(`recognised: ${raw.slice(0, 40)}`, r.known === true, r.title);
+  check('  and names SilentScribe as the cause', /SilentScribe/.test(r.title), r.title);
+  check('  and gives something to do', /reload|issue/i.test(r.action), r.action);
+}
+
+// The generic signature is last on purpose and must never steal a specific one.
+console.log('\n[it does not swallow specific errors]');
+for (const [raw, expected] of [
+  ['429 rate limit', /rate limiting/],
+  ['Failed to fetch', /could not be reached/],
+  ['QuotaExceededError: storage quota', /Storage is full/],
+  ['NotAllowedError: Permission denied', /Microphone/],
+  ['401 Incorrect API key', /key was rejected/],
+]) {
+  check(`still classified correctly: ${raw.slice(0, 30)}`, expected.test(explainError(raw).title), explainError(raw).title);
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

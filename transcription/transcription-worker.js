@@ -185,6 +185,15 @@ function configureOnnxRuntime(env) {
   wasm.proxy = false;
   wasm.wasmPaths = new URL('../lib/', self.location.href).href;
 
+  // Quiet the graph optimizer. Loading Whisper emits a run of
+  // "[W:onnxruntime:...] Removing initializer ... not used by any node"
+  // warnings, which are the optimizer reporting normal work on the published
+  // model — nothing is wrong and there is nothing to fix. Chrome collects
+  // extension warnings into the Errors list on chrome://extensions, so leaving
+  // them on buries real failures under noise that looks alarming and is not.
+  const onnx = env.backends?.onnx;
+  if (onnx) onnx.logLevel = 'error';
+
   console.log(`[Transcription Worker] ONNX configured: 1 thread, wasm from ${wasm.wasmPaths}`);
 }
 

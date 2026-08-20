@@ -97,7 +97,7 @@ function boundCard(shortcut) {
   card.append(
     head,
     combo,
-    el('p', 'shortcut-note', 'You can also click the SilentScribe icon in the toolbar.'),
+    el('p', 'shortcut-note', 'No shortcut needed: the toolbar icon opens this panel, and Start Recording is at the top.'),
     change,
   );
   return card;

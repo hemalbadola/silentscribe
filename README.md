@@ -88,6 +88,20 @@ npm test          # test suites
 
 `npm run check` catches what a browser only reports at runtime: a syntax error, an import of a renamed export, an element id the panel looks up but the HTML does not define, an undefined CSS custom property, a manifest pointing at a missing file, and anything shaped like an API key in a file that would be packaged. It has no dependencies.
 
+### Chrome APIs are not available everywhere
+
+The same `chrome.*` call is correct in one file and a crash in another, and nothing in JavaScript says so. `npm run check` walks the import graph from each entry point — through `await import(...)` as well as static imports — and fails on any call the context does not have:
+
+| Context | Gets |
+| --- | --- |
+| `background/service-worker.js` | everything the manifest permits |
+| `sidepanel/*` | everything the manifest permits |
+| `offscreen/offscreen.js` | **`chrome.runtime` only** |
+| `content/content.js` | `chrome.runtime`, `chrome.storage`, `chrome.i18n` |
+| `transcription/transcription-worker.js` | **nothing** |
+
+The offscreen document is the trap. It has the full DOM and every media API, so it feels like an ordinary page, but `chrome.storage` is undefined there. Anything it needs from storage is requested from the service worker with `MSG.OFFSCREEN_GET_SETTINGS`. A util shared with the side panel has to obey the offscreen limit too, which is why the check follows imports rather than reading one file.
+
 ## Stack
 
 - Manifest V3, no framework, no bundler — plain ES modules loaded by Chrome

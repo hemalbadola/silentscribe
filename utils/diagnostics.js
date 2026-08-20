@@ -81,7 +81,7 @@ const ERROR_SIGNATURES = [
     cause:
       'Tab capture only works when the recording is started by a click on the '
       + 'extension, on the tab being recorded.',
-    action: 'Focus the meeting tab, then press Record in the side panel.',
+    action: 'Focus the meeting tab, then press Start Recording in the side panel.',
   },
   {
     match: /Permission denied|NotAllowedError|microphone/i,
@@ -116,12 +116,32 @@ const ERROR_SIGNATURES = [
     action: 'Check the connection, then check the base URL in Settings.',
   },
   {
+    // The worst failure in the product: the audio did not reach the disk. It
+    // must never read as a generic problem, because the recording is the one
+    // thing that cannot be redone.
+    match: /Could not save the .* audio|recording could not be saved/i,
+    title: 'The recording could not be saved',
+    cause: 'Audio was captured, but writing it to disk failed partway through, so the file is incomplete.',
+    action: 'Free up disk space, then record again. Check Settings → Diagnostics for storage usage. Any earlier recordings are unaffected.',
+  },
+  {
     // Last, and deliberately narrow. An earlier version matched the bare word
     // "quota", which made every provider 429 read as a full disk.
     match: /QuotaExceededError|storage quota|disk is full|out of disk|exceeded the quota/i,
     title: 'Storage is full',
     cause: 'The browser refused to write more data for this extension.',
     action: 'Delete some past recordings to free space, then try again.',
+  },
+  {
+    // The shape of a JavaScript fault inside the extension itself. Saying so
+    // plainly is the point: the user who saw "Cannot read properties of
+    // undefined (reading 'local')" had no way to know it was our bug and not
+    // their microphone, their key or their machine, so they had nothing to try.
+    // Kept last, so a specific signature always wins over this one.
+    match: /Cannot read propert|is not a function|is not defined|(undefined|null) is not an object/i,
+    title: 'SilentScribe hit a bug in its own code',
+    cause: 'A part of the extension called something that was not there. This is a fault in SilentScribe, not in your setup or your recording.',
+    action: 'Reload the extension at chrome://extensions. If it happens again, run Diagnostics, press Copy report, and open an issue with it — the report includes the detail below.',
   },
 ];
 

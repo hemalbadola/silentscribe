@@ -66,6 +66,16 @@ export const MSG = Object.freeze({
   /** Capture encountered an error. Payload: { error: string } */
   CAPTURE_ERROR:              'CAPTURE_ERROR',
 
+  /**
+   * Ask the service worker to read settings on the offscreen document's behalf.
+   * Payload: none. Responds: { liveTranscript: boolean, modelSize: string }
+   *
+   * An offscreen document gets `chrome.runtime` and nothing else — `chrome.storage`
+   * is undefined there, so reading a setting directly throws. The service worker
+   * owns storage and answers this.
+   */
+  OFFSCREEN_GET_SETTINGS:     'OFFSCREEN_GET_SETTINGS',
+
   /** Audio level update for visualization. Payload: { mic: number, tab: number } (0-1 range) */
   CAPTURE_LEVELS:             'CAPTURE_LEVELS',
 

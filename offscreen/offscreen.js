@@ -84,6 +84,14 @@ let micWriteStream = null;
 let primaryWritePromise = Promise.resolve();
 let micWritePromise = Promise.resolve();
 
+/**
+ * @type {string|null} The first OPFS write failure of the current capture.
+ * A failed write used to be logged to the console and swallowed, so a disk-full
+ * or quota error produced a truncated or empty file while the user was told the
+ * recording had been saved.
+ */
+let writeFailure = null;
+
 let primaryStartedAtPerf = null;
 let micStartedAtPerf = null;
 
@@ -99,8 +107,48 @@ let levelInterval = null;
 /** @type {Worker|null} Transcription Web Worker running Whisper */
 let transcriptionWorker = null;
 
+/**
+ * @type {boolean} True while transcriptionWorker is running a full transcription.
+ * A busy worker belongs to an earlier session: rebinding its onmessage delivered
+ * that session's TRANSCRIPTION_COMPLETE to the new handler, which saved one
+ * recording's transcript under a different recording's id.
+ */
+let transcriptionWorkerBusy = false;
+
+/**
+ * @type {boolean} True only when the capture that is starting created the worker.
+ * Transcription runs in the background after a recording ends, so a worker owned
+ * by an earlier session must survive a failed start of a new one.
+ */
+let workerStartedByThisCapture = false;
+
 /** @type {ScriptProcessorNode|null} Taps tab audio for the live preview */
 let livePreviewNode = null;
+
+/**
+ * @type {MediaStream[]} Streams built from the audio graph rather than captured
+ * from a device — the MediaRecorder destinations. Closing the AudioContext
+ * silences them but is not guaranteed to end their tracks, so they are stopped
+ * by name alongside the captured streams.
+ */
+let derivedStreams = [];
+
+/**
+ * @type {boolean} True from the moment a start is accepted until the capture is
+ * stopped. The service worker only marks RECORDING once the whole start sequence
+ * finishes, so without this two overlapping starts both ran and the second
+ * overwrote the first's AudioContext, streams, recorder and OPFS handle while
+ * the first was still recording through them.
+ */
+let captureActive = false;
+
+/**
+ * @type {Promise<void>|null} The stop that is currently running, if any.
+ * MediaRecorder.stop() flips `state` to 'inactive' synchronously, so a second
+ * concurrent stop found nothing to wait for and closed the OPFS streams while
+ * the first stop was still flushing its final chunks.
+ */
+let stopInFlight = null;
 
 /** Seconds of audio per live preview slice. */
 const LIVE_CHUNK_SECONDS = 5;
@@ -215,12 +263,117 @@ function handleMessage(message, sender, sendResponse) {
  * @returns {Promise<void>}
  * @throws {Error} If stream acquisition or AudioContext setup fails.
  */
-async function startCapture({ streamId, micEnabled, sessionId, sourceType }) {
+async function startCapture(config) {
+  // Refuse a second start rather than corrupt both recordings. The service
+  // worker only sets RECORDING once this whole sequence finishes, so a double
+  // hotkey press — or a hotkey and the button — sends two starts that both run.
+  // The second one reassigns audioContext, tabStream, recorderPrimary and
+  // primaryWriteStream while the first is still writing through them, which
+  // orphans the first recording's tracks and OPFS stream and leaves two files
+  // that are each missing half of a meeting.
+  if (captureActive) {
+    throw new Error('A recording is already starting or in progress.');
+  }
+  captureActive = true;
+
+  try {
+    await beginCapture(config);
+  } catch (err) {
+    // Leave nothing behind. A half-built capture holds the tab's audio tracks,
+    // an open AudioContext and an unclosed OPFS stream, so without this the
+    // "Try Again" button retries into a dirty state and fails differently the
+    // second time — which is how one bug turns into an unexplainable one.
+    await abortCapture();
+    // The guard is released here and in stopCapture, never only on success:
+    // a failed start that left it set would block recording forever.
+    captureActive = false;
+    throw err;
+  }
+}
+
+
+/**
+ * Release everything a capture may have acquired, in any order of partial
+ * construction. Never throws: this runs on the failure path, and an error here
+ * would mask the error that actually matters.
+ *
+ * @returns {Promise<void>}
+ */
+async function abortCapture() {
+  stopLevelMeters();
+  stopLivePreview();
+
+  for (const recorder of [recorderPrimary, recorderMic]) {
+    try {
+      if (recorder && recorder.state !== 'inactive') recorder.stop();
+    } catch { /* already torn down */ }
+  }
+
+  for (const mediaStream of [tabStream, micStream, ...derivedStreams]) {
+    try {
+      mediaStream?.getTracks().forEach((track) => track.stop());
+    } catch { /* already ended */ }
+  }
+  derivedStreams = [];
+
+  try {
+    if (audioContext && audioContext.state !== 'closed') await audioContext.close();
+  } catch { /* already closed */ }
+
+  for (const writeStream of [primaryWriteStream, micWriteStream]) {
+    try {
+      await writeStream?.close();
+    } catch { /* nothing was written */ }
+  }
+
+  // Only a worker THIS capture created may be terminated here. Transcription
+  // runs in the background after a recording completes, so terminating whatever
+  // worker happened to exist meant that a failed START of a new recording killed
+  // the transcription of a previous, finished one — the transcript was lost and
+  // nothing reported it.
+  if (transcriptionWorker && workerStartedByThisCapture) {
+    try {
+      transcriptionWorker.terminate();
+    } catch { /* already gone */ }
+    transcriptionWorker = null;
+    transcriptionWorkerBusy = false;
+  }
+  workerStartedByThisCapture = false;
+
+  audioContext = null;
+  recorderPrimary = null;
+  recorderMic = null;
+  tabStream = null;
+  micStream = null;
+  tabSourceNode = null;
+  micSourceNode = null;
+  tabAnalyser = null;
+  micAnalyser = null;
+  primaryWriteStream = null;
+  micWriteStream = null;
+  primaryWritePromise = Promise.resolve();
+  micWritePromise = Promise.resolve();
+
+  console.log('[SilentScribe Offscreen] Capture torn down after a failed start');
+}
+
+
+/**
+ * Build the capture pipeline. Call through startCapture, which guarantees
+ * cleanup when any step here fails.
+ *
+ * @param {Object} config - See startCapture.
+ * @returns {Promise<void>}
+ */
+async function beginCapture({ streamId, micEnabled, sessionId, sourceType }) {
   console.log(`[SilentScribe Offscreen] Starting capture — session: ${sessionId}, mic: ${micEnabled}, source: ${sourceType || 'tab'}`);
 
-  // Reset state for new recording
+  // Reset state for new recording. workerStartedByThisCapture starts false so a
+  // worker left running by an earlier session is never mistaken for ours.
   currentSessionId = sessionId;
   chunkIndex = 0;
+  writeFailure = null;
+  workerStartedByThisCapture = false;
   primaryWriteStream = await createWriteStream(`session_${sessionId}_primary.webm`);
 
   // ── Step 1: Create AudioContext ────────────────────────────────────────
@@ -287,11 +440,13 @@ async function startCapture({ streamId, micEnabled, sessionId, sourceType }) {
   // ── Step 5: Create recording destinations ──────────────────────────────
   const primaryDestination = audioContext.createMediaStreamDestination();
   tabSourceNode.connect(primaryDestination);
+  derivedStreams.push(primaryDestination.stream);
 
   let micDestination = null;
   if (micSourceNode) {
     micDestination = audioContext.createMediaStreamDestination();
     micSourceNode.connect(micDestination);
+    derivedStreams.push(micDestination.stream);
     micWriteStream = await createWriteStream(`session_${sessionId}_mic.webm`);
   }
 
@@ -331,7 +486,12 @@ async function startCapture({ streamId, micEnabled, sessionId, sourceType }) {
       primaryWritePromise = primaryWritePromise.then(() => 
         primaryWriteStream.write(event.data)
       ).catch(err => {
+        // The chain is reset to resolved so later chunks still try, but the
+        // failure itself must not stop here: a disk-full or quota error used to
+        // be logged to a console nobody has open, and the user was told the
+        // recording succeeded while the file was truncated or empty.
         console.error('[SilentScribe Offscreen] Failed to stream primary to OPFS:', err);
+        noteWriteFailure('primary', err);
       });
     }
   };
@@ -351,7 +511,10 @@ async function startCapture({ streamId, micEnabled, sessionId, sourceType }) {
         micWritePromise = micWritePromise.then(() => 
           micWriteStream.write(event.data)
         ).catch(err => {
+          // Reported for the same reason as the primary stream above: a
+          // swallowed write error is a silently broken recording.
           console.error('[SilentScribe Offscreen] Failed to stream mic to OPFS:', err);
+          noteWriteFailure('mic', err);
         });
       }
     };
@@ -390,6 +553,36 @@ async function startCapture({ streamId, micEnabled, sessionId, sourceType }) {
 
 /**
  * Stop audio capture and finalize the recording.
+ *
+ * Stops are serialised. MediaRecorder.stop() flips `state` to 'inactive'
+ * synchronously, so a second concurrent stop found both recorders already
+ * inactive, skipped the onstop wait entirely, and tore down and closed the OPFS
+ * streams while the first stop was still flushing its final chunks — a double
+ * stop truncated or lost the recording. A second caller now awaits the first
+ * stop instead of racing it.
+ *
+ * @param {Object} [options] - { transcribe?: boolean }
+ * @returns {Promise<void>}
+ */
+async function stopCapture(options) {
+  if (stopInFlight) {
+    console.log('[SilentScribe Offscreen] A stop is already running — awaiting it');
+    return stopInFlight;
+  }
+
+  stopInFlight = endCapture(options).finally(() => {
+    stopInFlight = null;
+    // Released whether the stop succeeded or threw. A stop that failed and left
+    // the start guard set would block every later recording.
+    captureActive = false;
+  });
+
+  return stopInFlight;
+}
+
+
+/**
+ * Finalize the recording. Call through stopCapture, which serialises stops.
  * 
  * This function:
  * 1. Stops the MediaRecorder (triggers final ondataavailable)
@@ -401,7 +594,7 @@ async function startCapture({ streamId, micEnabled, sessionId, sourceType }) {
  * 
  * @returns {Promise<void>}
  */
-async function stopCapture(options) {
+async function endCapture(options) {
   // The user picks at stop time whether to transcribe or just keep the video.
   // No payload means transcribe, so the keyboard shortcut is unchanged.
   const transcribe = options?.transcribe !== false;
@@ -438,6 +631,8 @@ async function stopCapture(options) {
   if (micStream) {
     micStream.getTracks().forEach((track) => track.stop());
   }
+  derivedStreams.forEach((derived) => derived.getTracks().forEach((track) => track.stop()));
+  derivedStreams = [];
 
   // Stop level meter updates
   stopLevelMeters();
@@ -468,6 +663,26 @@ async function stopCapture(options) {
     micWriteStream = null;
   }
 
+  // Clean up references (but keep keepalive port). Done before the outcome is
+  // decided, so a recording that failed to save still releases everything.
+  audioContext = null;
+  recorderPrimary = null;
+  recorderMic = null;
+  tabStream = null;
+  micStream = null;
+  tabSourceNode = null;
+  micSourceNode = null;
+  tabAnalyser = null;
+  micAnalyser = null;
+
+  // A capture whose writes failed produced a truncated or empty file, whatever
+  // the recorder reported. Sending CAPTURE_COMPLETE here would mark the session
+  // saved and start transcribing a broken file, so the stop is reported as a
+  // failure instead. The WebM stays in OPFS for a manual retry.
+  if (writeFailure) {
+    throw new Error(writeFailure);
+  }
+
   // Notify service worker that capture is complete
   chrome.runtime.sendMessage({
     type: MSG.CAPTURE_COMPLETE,
@@ -482,22 +697,39 @@ async function stopCapture(options) {
   } else {
     console.log('[SilentScribe Offscreen] Transcription skipped by user choice.');
   }
-
-  // Clean up references (but keep keepalive port)
-  audioContext = null;
-  recorderPrimary = null;
-  recorderMic = null;
-  tabStream = null;
-  micStream = null;
-  tabSourceNode = null;
-  micSourceNode = null;
-  tabAnalyser = null;
-  micAnalyser = null;
 }
 
 // ============================================================================
 // LIVE TRANSCRIPT PREVIEW
 // ============================================================================
+
+/**
+ * Read the settings this document needs from the service worker.
+ *
+ * An offscreen document is handed `chrome.runtime` and essentially nothing
+ * else. `chrome.storage` is undefined here, so touching `chrome.storage.local`
+ * throws `Cannot read properties of undefined (reading 'local')` — which used
+ * to happen on the first line of capture and killed the recording before a
+ * single sample was written.
+ *
+ * Never rejects. A recording must survive a settings read failing, so a
+ * failure falls back to the same defaults as an empty setting.
+ *
+ * @returns {Promise<{liveTranscript: boolean, modelSize: string}>}
+ */
+async function getSettings() {
+  const defaults = { liveTranscript: false, modelSize: WHISPER_CONFIG.MODEL_ID };
+
+  try {
+    const reply = await chrome.runtime.sendMessage({ type: MSG.OFFSCREEN_GET_SETTINGS });
+    // No listener, or the worker was replaced mid-flight, gives undefined.
+    return reply ? { ...defaults, ...reply } : defaults;
+  } catch (err) {
+    console.warn('[SilentScribe Offscreen] Could not read settings, using defaults:', err.message);
+    return defaults;
+  }
+}
+
 
 /**
  * Feed short slices of tab audio to the transcription worker while recording,
@@ -514,14 +746,14 @@ async function stopCapture(options) {
  * @returns {Promise<void>}
  */
 async function startLivePreview(sessionId) {
-  const stored = await chrome.storage.local.get(['liveTranscript', 'modelSize']);
-  if (!stored.liveTranscript) return;
+  const { liveTranscript, modelSize } = await getSettings();
+  if (!liveTranscript) return;
 
   console.log('[SilentScribe Offscreen] Live transcript preview enabled');
   startTranscriptionWorkerEarly(sessionId);
   if (!transcriptionWorker) return;
 
-  const modelId = stored.modelSize || WHISPER_CONFIG.MODEL_ID;
+  const modelId = modelSize;
   const targetRate = AUDIO_CONFIG.WHISPER_SAMPLE_RATE;
   const ratio = audioContext.sampleRate / targetRate;
 
@@ -570,6 +802,9 @@ function startTranscriptionWorkerEarly(sessionId) {
       new URL('../transcription/transcription-worker.js', import.meta.url),
       { type: 'module' },
     );
+    // This capture owns it, so abortCapture may terminate it. A worker that was
+    // already there belongs to an earlier session and is not ours to kill.
+    workerStartedByThisCapture = true;
   } catch (err) {
     console.warn('[SilentScribe Offscreen] Could not pre-start the worker:', err.message);
     return;
@@ -583,8 +818,8 @@ function startTranscriptionWorkerEarly(sessionId) {
     }).catch(() => {});
   };
 
-  transcriptionWorker.onerror = (err) => {
-    console.warn('[SilentScribe Offscreen] Live preview worker error:', err.message);
+  transcriptionWorker.onerror = (event) => {
+    console.warn('[SilentScribe Offscreen] Live preview worker error:', describeWorkerError(event));
   };
 }
 
@@ -707,18 +942,22 @@ async function runOfflineTranscription(sessionId) {
 async function startTranscription(tabPcm, micPcm, sessionId, primaryOffsetMs = 0, micOffsetMs = 0) {
   console.log('[SilentScribe Offscreen] Starting dual-track transcription worker...');
 
-  // Reuse the worker the live preview pre-warmed, when there is one: its model
-  // is already loaded, which is nearly all of the startup cost. Its onmessage
-  // is replaced below, so the live-chunk handler does not survive.
+  // Reuse the worker the live preview pre-warmed only when it is IDLE: its model
+  // is already loaded, which is nearly all of the startup cost, and its onmessage
+  // is replaced below so the live-chunk handler does not survive.
   //
-  // Only one worker may exist at a time. Dropping the handle to a running one
-  // would leak a thread still holding a loaded Whisper model.
-  const reusable = Boolean(transcriptionWorker);
-  if (reusable) {
+  // A BUSY worker is still running a previous session's transcription. Rebinding
+  // its onmessage delivered that older job's TRANSCRIPTION_COMPLETE to this new
+  // handler, which saved it under the NEW sessionId — one recording's transcript
+  // filed against a different recording. A busy worker is left to finish and
+  // report through the handlers it already holds.
+  let worker;
+  if (transcriptionWorker && !transcriptionWorkerBusy) {
     console.log('[SilentScribe Offscreen] Reusing the pre-warmed transcription worker');
+    worker = transcriptionWorker;
   } else {
     try {
-      transcriptionWorker = new Worker(
+      worker = new Worker(
         new URL('../transcription/transcription-worker.js', import.meta.url),
         { type: 'module' }
       );
@@ -732,11 +971,27 @@ async function startTranscription(tabPcm, micPcm, sessionId, primaryOffsetMs = 0
     }
   }
 
+  transcriptionWorker = worker;
+  transcriptionWorkerBusy = true;
+
+  // Every handler below closes over `worker`, never over the module variable.
+  // Two jobs can now overlap, and a handler that terminated transcriptionWorker
+  // would terminate whichever worker happened to be newest instead of its own.
+  const releaseWorker = () => {
+    try {
+      worker.terminate();
+    } catch { /* already gone */ }
+    if (transcriptionWorker === worker) {
+      transcriptionWorker = null;
+      transcriptionWorkerBusy = false;
+    }
+  };
+
   // Store PCM references for diarization after transcription
   const tabPcmRef = tabPcm;
   const micPcmRef = micPcm;
 
-  transcriptionWorker.onmessage = (event) => {
+  worker.onmessage = (event) => {
     const { type, payload } = event.data;
 
     switch (type) {
@@ -759,8 +1014,7 @@ async function startTranscription(tabPcm, micPcm, sessionId, primaryOffsetMs = 0
         }).catch(() => {});
 
         // Clean up worker
-        transcriptionWorker.terminate();
-        transcriptionWorker = null;
+        releaseWorker();
         break;
 
       case 'TRANSCRIPTION_ERROR':
@@ -768,29 +1022,31 @@ async function startTranscription(tabPcm, micPcm, sessionId, primaryOffsetMs = 0
           type: MSG.TRANSCRIPTION_ERROR,
           payload,
         }).catch(() => {});
-        transcriptionWorker.terminate();
-        transcriptionWorker = null;
+        releaseWorker();
         break;
     }
   };
 
-  transcriptionWorker.onerror = (err) => {
-    console.error('[SilentScribe Offscreen] Transcription worker error:', err);
+  worker.onerror = (event) => {
+    console.error('[SilentScribe Offscreen] Transcription worker error:', event);
     chrome.runtime.sendMessage({
       type: MSG.TRANSCRIPTION_ERROR,
-      payload: { error: `Transcription worker crashed: ${err.message}` },
+      payload: { error: `Transcription worker crashed: ${describeWorkerError(event)}` },
     }).catch(() => {});
+    // A crashed worker can never report completion, so release it. Leaving it
+    // marked busy would stop every later run from reusing a warm worker.
+    releaseWorker();
   };
 
-  // The accuracy setting lives in chrome.storage.local. The worker has no
-  // chrome API access, so the model id travels in the message payload.
-  const stored = await chrome.storage.local.get('modelSize');
-  const modelId = stored.modelSize || WHISPER_CONFIG.MODEL_ID;
+  // The accuracy setting lives in storage, which only the service worker can
+  // reach. The worker has no chrome API at all, so the model id travels the
+  // rest of the way in the message payload.
+  const { modelSize: modelId } = await getSettings();
   console.log(`[SilentScribe Offscreen] Transcribing with model: ${modelId}`);
 
   // Start the transcription process with BOTH buffers.
   // The worker will transcribe them sequentially and merge them.
-  transcriptionWorker.postMessage(
+  worker.postMessage(
     {
       type: 'START_DUAL_TRANSCRIPTION',
       payload: {
@@ -799,7 +1055,12 @@ async function startTranscription(tabPcm, micPcm, sessionId, primaryOffsetMs = 0
         micPcmData: micPcm.buffer,
         primaryOffsetMs,
         micOffsetMs,
-        sampleRate: AUDIO_CONFIG.CONTEXT_SAMPLE_RATE,
+        // The rate of the PCM being sent, not the rate of the capture graph.
+        // decodeWebM decodes at 16kHz, but 48000 was sent, and the worker uses
+        // this value for its `length >= sampleRate * 0.5` minimum-length guard.
+        // The threshold was therefore 3x too high and every recording shorter
+        // than about 1.5 seconds was dropped without a word of explanation.
+        sampleRate: AUDIO_CONFIG.WHISPER_SAMPLE_RATE,
         modelId,
       },
     },
@@ -1055,6 +1316,46 @@ function sendCaptureError(errorMessage) {
   }).catch(() => {
     console.error('[SilentScribe Offscreen] Could not send error to service worker');
   });
+}
+
+
+/**
+ * Record and report the first OPFS write failure of a capture.
+ *
+ * The write chain is reset to resolved after a failure so later chunks still
+ * try, which used to hide the failure completely: a disk-full or quota error
+ * left a truncated or empty file and the user was told the recording succeeded.
+ * Only the FIRST failure is sent — every following chunk fails for the same
+ * reason, and one error per chunk would bury the panel.
+ *
+ * @param {string} which - Which stream failed: 'primary' or 'mic'.
+ * @param {Error} err - The write error.
+ * @returns {void}
+ */
+function noteWriteFailure(which, err) {
+  if (writeFailure) return;
+
+  writeFailure = `Could not save the ${which} audio: ${err?.message || 'the storage write failed'}`;
+  sendCaptureError(writeFailure);
+}
+
+
+/**
+ * Describe a Worker error in words a person can read.
+ *
+ * `Worker.onerror` receives an ErrorEvent, not an Error. When the worker SCRIPT
+ * fails to load — the most common failure by far — `message` is undefined, so
+ * interpolating it showed the user literally "Transcription worker crashed:
+ * undefined", which says nothing about what went wrong or where.
+ *
+ * @param {ErrorEvent} event - The event passed to onerror.
+ * @returns {string} A non-empty description.
+ */
+function describeWorkerError(event) {
+  const where = event?.filename ? ` (${event.filename}:${event.lineno ?? 0})` : '';
+  const what = event?.message || event?.error?.message || '';
+
+  return what ? `${what}${where}` : `the worker script could not be loaded or run${where}`;
 }
 
 
