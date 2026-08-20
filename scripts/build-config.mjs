@@ -11,11 +11,12 @@
  *
  *   node scripts/build-config.mjs
  *
- * SECURITY: the generated file contains the API key in plain text, and it
- * ships inside the extension. Anyone who installs the extension can read it.
- * That is acceptable only for a trusted audience. Both `.claude/.env` and the
- * generated file are listed in .gitignore. Rotate the key through the remote
- * config URL rather than by redistributing the extension.
+ * NO KEY IS WRITTEN. An earlier version bundled one, which was a mistake: a key
+ * inside an extension is readable by anyone who installs it and shows in the
+ * network panel of every machine that runs it. Each user enters their own in
+ * Settings. This script only saves them picking a provider and model.
+ *
+ * `.claude/.env` and the generated file both stay in .gitignore.
  *
  * Recognised variables in .claude/.env:
  *   NVIDIA_API_KEY | SILENTSCRIBE_API_KEY | API_KEY   the key to bundle
@@ -29,7 +30,6 @@
  * @module scripts/build-config
  */
 
-import { randomBytes } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -159,53 +159,6 @@ function mask(apiKey) {
 
 
 
-/**
- * Encode the key so it appears nowhere in the build as readable text.
- *
- * WHAT THIS DOES: defeats automated scrapers. Bots that scan public files and
- * release archives for /nvapi-[A-Za-z0-9_-]{40,}/ find nothing, because no
- * substring of the key exists in the output and there is no base64 of it
- * either. Every build produces different bytes, so a leaked build cannot be
- * matched against another.
- *
- * WHAT THIS DOES NOT DO: hide the key from a person. The extension must send
- * `Authorization: Bearer <key>` for the provider to accept the request, so the
- * key is visible in the DevTools network panel of any machine running it, no
- * matter how it is stored here. Treat it as shared with everyone who has the
- * extension. Rotate it through the config URL, not by rebuilding.
- *
- * Layers, applied in order:
- *   1. XOR every byte with a random pad, repeating.
- *   2. Cut the result into chunks.
- *   3. Shuffle the chunks by a random permutation.
- * The pad and the permutation ship alongside, which is the point: this is
- * obfuscation, not encryption, and it is labelled as such.
- *
- * @param {string} apiKey - The key to encode.
- * @returns {{pad: number[], chunks: number[][], order: number[]}}
- */
-function obfuscate(apiKey) {
-  const bytes = [...Buffer.from(apiKey, 'utf8')];
-  const pad = [...randomBytes(29)];
-
-  const masked = bytes.map((byte, i) => byte ^ pad[i % pad.length]);
-
-  // Cut into chunks of uneven size so chunk boundaries carry no information
-  // about the key's length.
-  const chunks = [];
-  for (let i = 0; i < masked.length; i += 7) chunks.push(masked.slice(i, i + 7));
-
-  // A random permutation, stored as the position each chunk belongs at.
-  const order = chunks.map((_, i) => i);
-  for (let i = order.length - 1; i > 0; i--) {
-    const j = randomBytes(1)[0] % (i + 1);
-    [order[i], order[j]] = [order[j], order[i]];
-  }
-
-  const shuffled = order.map((position) => chunks[position]);
-  return { pad, chunks: shuffled, order };
-}
-
 function main() {
   if (!existsSync(ENV_PATH)) {
     console.error(`No .env found at ${ENV_PATH}`);
@@ -226,46 +179,28 @@ function main() {
   const model = env.SILENTSCRIBE_MODEL || DEFAULT_MODEL[provider] || '';
   const configUrl = env.SILENTSCRIBE_CONFIG_URL || '';
 
-  const { pad, chunks, order } = obfuscate(apiKey);
-
   const generated = `/**
- * SilentScribe — Managed Config (GENERATED — DO NOT EDIT)
+ * SilentScribe — Local Defaults (GENERATED — DO NOT EDIT)
  * ============================================================================
  *
  * Written by scripts/build-config.mjs from .claude/.env.
- * Run \`node scripts/build-config.mjs\` after changing that file.
  *
- * This module is in .gitignore because it holds an API key in plain text.
- * The key ships inside the extension and any installer can read it, so treat
- * it as shared-with-your-team, never as a secret. To rotate it everywhere at
- * once, publish a new key at the remote config URL instead of rebuilding.
+ * THIS FILE HOLDS NO CREDENTIAL, and the build refuses to put one here. A key
+ * inside an extension is readable by anyone who installs it, and it appears in
+ * the network panel of every machine that runs it, so there is no way to ship
+ * one and keep it secret. Each user enters their own key in Settings.
+ *
+ * What this does carry is the provider and model your team uses, so a new
+ * install has everything filled in except the key itself.
  *
  * @module managed-config
  */
-
-const P = ${JSON.stringify(pad)};
-const C = ${JSON.stringify(chunks)};
-const O = ${JSON.stringify(order)};
-
-/**
- * Rebuild the key. Kept as a function so the plain value is never a
- * module-level binding that a heap dump or a source scan can pick up.
- *
- * @returns {string}
- */
-function k() {
-  const parts = [];
-  O.forEach((position, i) => { parts[position] = C[i]; });
-  const masked = parts.flat();
-  return masked.map((b, i) => String.fromCharCode(b ^ P[i % P.length])).join('');
-}
 
 export const MANAGED_CONFIG = Object.freeze({
   provider:  ${JSON.stringify(provider)},
   model:     ${JSON.stringify(model)},
   configUrl: ${JSON.stringify(configUrl)},
   builtAt:   ${JSON.stringify(new Date().toISOString())},
-  get apiKey() { return k(); },
 });
 `;
 
@@ -274,8 +209,10 @@ export const MANAGED_CONFIG = Object.freeze({
   console.log('Wrote utils/managed-config.js');
   console.log(`  provider   ${provider}`);
   console.log(`  model      ${model || '(none — set SILENTSCRIBE_MODEL)'}`);
-  console.log(`  key        ${mask(apiKey)}`);
   console.log(`  config URL ${configUrl || '(none — set SILENTSCRIBE_CONFIG_URL to enable push updates)'}`);
+  console.log('');
+  console.log(`  The key in .claude/.env (${mask(apiKey)}) was NOT written.`);
+  console.log('  Keys are entered per user in Settings; none ships with the extension.');
 }
 
 main();
